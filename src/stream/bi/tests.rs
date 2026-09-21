@@ -32,8 +32,13 @@ type Streams = ArcBiStreams<Io, Io>;
 fn insert(streams: &Streams, id: u64) -> (H3ReadStream<Io>, H3WriteStream<Io>, Io, Io) {
     let recv = Io::default();
     let send = Io::default();
-    let (read, write) =
-        streams.insert(&mut streams.lock().unwrap(), id, recv.clone(), send.clone());
+    let (read, write) = streams.insert(
+        &mut streams.lock().unwrap(),
+        id,
+        recv.clone(),
+        send.clone(),
+        qpack(),
+    );
     (read, write, recv, send)
 }
 
@@ -78,7 +83,7 @@ fn empty_registry_drains_only_after_local_goaway_and_wakes_waiter() {
 }
 
 #[test]
-fn drain_waits_for_both_directions_in_either_completion_order() {
+fn cancelling_either_direction_cancels_both_and_completes_drain() {
     for read_first in [true, false] {
         let streams = Streams::new(Role::Server);
         streams.lock().unwrap().accept(sid(0)).unwrap();
@@ -96,15 +101,8 @@ fn drain_waits_for_both_directions_in_either_completion_order() {
         }
         {
             let guard = streams.lock().unwrap();
-            assert_eq!(guard.reads.len(), usize::from(!read_first));
-            assert_eq!(guard.writes.len(), usize::from(read_first));
-        }
-        assert!(Pin::new(&mut drain).poll(&mut cx).is_pending());
-        assert_eq!(count.0.load(Ordering::SeqCst), 0);
-        if read_first {
-            (&write).cancel(42);
-        } else {
-            read.stop(42);
+            assert!(guard.reads.is_empty());
+            assert!(guard.writes.is_empty());
         }
         assert_eq!(count.0.load(Ordering::SeqCst), 1);
         assert!(Pin::new(&mut drain).poll(&mut cx).is_ready());
@@ -115,7 +113,7 @@ fn drain_waits_for_both_directions_in_either_completion_order() {
 }
 
 #[test]
-fn dropping_application_handles_unregisters_each_direction() {
+fn dropping_application_handles_only_unregisters_each_direction() {
     let streams = Streams::new(Role::Client);
     let clone = streams.clone();
     let (read, write, recv, send) = insert(&streams, 0);
@@ -126,9 +124,8 @@ fn dropping_application_handles_unregisters_each_direction() {
     assert_eq!(clone.lock().unwrap().writes.len(), 1);
     drop(write);
     assert!(clone.lock().unwrap().writes.is_empty());
-    let code = ErrorCode::H3_REQUEST_CANCELLED.as_u64();
-    assert_eq!(recv.codes(), [code]);
-    assert_eq!(send.codes(), [code]);
+    assert!(recv.codes().is_empty());
+    assert!(send.codes().is_empty());
 }
 
 #[test]
@@ -146,7 +143,7 @@ fn rejection_is_inclusive_directional_sorted_and_deduplicated() {
         assert_eq!(guard.reads.contains_key(id), !rejected);
         assert_eq!(guard.writes.contains_key(id), !rejected);
         let expected = if rejected {
-            vec![ErrorCode::H3_REQUEST_REJECTED.as_u64()]
+            vec![ErrorCode::RequestRejected.as_u64()]
         } else {
             vec![]
         };
@@ -175,7 +172,7 @@ fn local_goaway_freezes_acceptance_and_preserves_admitted_streams() {
         );
         assert_eq!(
             guard.local_not_goway().unwrap_err().code,
-            ErrorCode::H3_REQUEST_REJECTED
+            ErrorCode::RequestRejected
         );
         assert!(guard.accept(sid(first)).is_err());
         assert!(guard.remote_no_goway().is_ok());
@@ -201,7 +198,7 @@ fn remote_goaway_blocks_opening_without_starting_local_drain() {
     assert!(notification.as_mut().poll(&mut cx).is_ready());
     assert_eq!(
         guard.remote_no_goway().unwrap_err().code,
-        ErrorCode::H3_REQUEST_REJECTED
+        ErrorCode::RequestRejected
     );
     assert!(guard.local_not_goway().is_ok());
     assert!(guard.reads.contains_key(&0));
@@ -220,8 +217,8 @@ fn close_clears_registries_propagates_error_and_completes_drain() {
     let mut drain = streams.drain();
     let mut guard = streams.lock().unwrap();
     guard.goaway(&qpack()).unwrap();
-    guard.close(ErrorCode::H3_INTERNAL_ERROR.reason("test close"));
-    guard.close(ErrorCode::H3_INTERNAL_ERROR.reason("repeat close"));
+    guard.close(ErrorCode::InternalError.reason("test close"));
+    guard.close(ErrorCode::InternalError.reason("repeat close"));
     assert!(guard.reads.is_empty());
     assert!(guard.writes.is_empty());
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -229,7 +226,7 @@ fn close_clears_registries_propagates_error_and_completes_drain() {
     drop(guard);
     for (read, write, recv, send) in handles {
         drop((read, write));
-        assert_eq!(recv.codes(), [ErrorCode::H3_INTERNAL_ERROR.as_u64()]);
-        assert_eq!(send.codes(), [ErrorCode::H3_INTERNAL_ERROR.as_u64()]);
+        assert_eq!(recv.codes(), [ErrorCode::InternalError.as_u64()]);
+        assert_eq!(send.codes(), [ErrorCode::InternalError.as_u64()]);
     }
 }

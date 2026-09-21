@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use h3x::{ErrorCode, H3Connection, Result, Role, Settings, Transport};
+use h3x::{Error, ErrorCode, H3Connection, Result, Role, Settings, Transport, TransportError};
 use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::{
     io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex},
@@ -65,6 +65,12 @@ impl CancelStream for Stream {
     fn cancel(&mut self, _: u64) {}
 }
 
+impl TransportError for Stream {
+    fn map_error(error: std::io::Error) -> Error {
+        Error::from_stream_io(error)
+    }
+}
+
 impl Transport for Connection {
     type StreamReader = Stream;
     type StreamWriter = Stream;
@@ -77,14 +83,14 @@ impl Transport for Connection {
         let id = self.next_bi.fetch_add(4, Ordering::Relaxed);
         let (local, peer) = bi_stream();
         self.outgoing_bi.send((id, peer)).map_err(|_| {
-            ErrorCode::H3_INTERNAL_ERROR.reason("peer stopped accepting bidirectional streams")
+            ErrorCode::InternalError.reason("peer stopped accepting bidirectional streams")
         })?;
         Ok(Some((id, local)))
     }
 
     async fn accept_bi(&self) -> Result<BiStream> {
         self.incoming_bi.lock().await.recv().await.ok_or_else(|| {
-            ErrorCode::H3_INTERNAL_ERROR.reason("peer closed the bidirectional stream queue")
+            ErrorCode::InternalError.reason("peer closed the bidirectional stream queue")
         })
     }
 
@@ -92,14 +98,14 @@ impl Transport for Connection {
         let id = self.next_uni.fetch_add(4, Ordering::Relaxed);
         let (writer, reader) = duplex(STREAM_CAPACITY);
         self.outgoing_uni.send((id, Stream(reader))).map_err(|_| {
-            ErrorCode::H3_INTERNAL_ERROR.reason("peer stopped accepting unidirectional streams")
+            ErrorCode::InternalError.reason("peer stopped accepting unidirectional streams")
         })?;
         Ok(Some((id, Stream(writer))))
     }
 
     async fn accept_uni(&self) -> Result<UniStream> {
         self.incoming_uni.lock().await.recv().await.ok_or_else(|| {
-            ErrorCode::H3_INTERNAL_ERROR.reason("peer closed the unidirectional stream queue")
+            ErrorCode::InternalError.reason("peer closed the unidirectional stream queue")
         })
     }
 

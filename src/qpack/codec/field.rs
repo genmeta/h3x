@@ -39,7 +39,7 @@ impl FieldSectionPrefix {
             .and_then(|absolute| absolute.checked_sub(1))
             .filter(|&absolute| absolute < self.required_insert_count)
             .ok_or_else(|| {
-                ErrorCode::QPACK_DECOMPRESSION_FAILED
+                ErrorCode::QpackDecompressionFailed
                     .reason("dynamic relative index is outside Required Insert Count")
             })
     }
@@ -50,7 +50,7 @@ impl FieldSectionPrefix {
             .checked_add(index)
             .filter(|&absolute| absolute < self.required_insert_count)
             .ok_or_else(|| {
-                ErrorCode::QPACK_DECOMPRESSION_FAILED
+                ErrorCode::QpackDecompressionFailed
                     .reason("post-Base index is outside Required Insert Count")
             })
     }
@@ -104,7 +104,7 @@ impl FieldLine {
     }
 
     /// Resolve name/value through the static or dynamic table; reject invalid or evicted
-    /// indices as QPACK_DECOMPRESSION_FAILED. Pure lookup: no ACKs or table mutations.
+    /// indices as QpackDecompressionFailed. Pure lookup: no ACKs or table mutations.
     pub(crate) fn resolve(
         &self,
         prefix: FieldSectionPrefix,
@@ -115,7 +115,7 @@ impl FieldLine {
         }
         let mut field = if let Some(absolute) = self.dynamic_index(prefix)? {
             table.get(absolute).cloned().ok_or_else(|| {
-                ErrorCode::QPACK_DECOMPRESSION_FAILED
+                ErrorCode::QpackDecompressionFailed
                     .reason("dynamic table entry is missing or has been evicted")
             })?
         } else {
@@ -126,7 +126,7 @@ impl FieldLine {
                 _ => unreachable!("only static references have no dynamic dependency here"),
             };
             let (name, value) = table::get(index).ok_or_else(|| {
-                ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("static table index is out of range")
+                ErrorCode::QpackDecompressionFailed.reason("static table index is out of range")
             })?;
             Field {
                 name: Bytes::from_static(name.as_bytes()),
@@ -168,7 +168,7 @@ impl<B: BufMut> WriteField for B {
             || prefix.required_insert_count > VARINT_MAX
             || prefix.base > VARINT_MAX
         {
-            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
+            return Err(ErrorCode::QpackDecompressionFailed
                 .reason("field section prefix exceeds the QUIC variable-integer range"));
         }
         let encoded_insert_count = if prefix.required_insert_count == 0 {
@@ -176,7 +176,7 @@ impl<B: BufMut> WriteField for B {
         } else {
             let full_range = 2 * (max_capacity / 32);
             if full_range == 0 {
-                return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
+                return Err(ErrorCode::QpackDecompressionFailed
                     .reason("nonzero Required Insert Count with a table too small for entries"));
             }
             prefix.required_insert_count % full_range + 1
@@ -233,7 +233,7 @@ pub(crate) fn be_field_section_prefix(
     insert_count: u64,
 ) -> Result<(&[u8], FieldSectionPrefix)> {
     if max_capacity > VARINT_MAX || insert_count > VARINT_MAX {
-        return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
+        return Err(ErrorCode::QpackDecompressionFailed
             .reason("table capacity or insert count exceeds the QUIC variable-integer range"));
     }
     let (input, encoded_insert_count) = be_prefixed_integer(input, 8)?;
@@ -244,7 +244,7 @@ pub(crate) fn be_field_section_prefix(
         let max_entries = max_capacity / 32;
         let full_range = 2 * max_entries;
         if encoded_insert_count > full_range {
-            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
+            return Err(ErrorCode::QpackDecompressionFailed
                 .reason("encoded Required Insert Count exceeds the table wrap range"));
         }
         let max_value = insert_count + max_entries;
@@ -252,20 +252,20 @@ pub(crate) fn be_field_section_prefix(
         let mut count = max_wrapped + encoded_insert_count - 1;
         if count > max_value {
             if count <= full_range {
-                return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED
+                return Err(ErrorCode::QpackDecompressionFailed
                     .reason("Required Insert Count cannot be reconstructed from the table state"));
             }
             count -= full_range;
         }
         if count == 0 || count > VARINT_MAX {
-            return Err(ErrorCode::QPACK_DECOMPRESSION_FAILED.reason(
+            return Err(ErrorCode::QpackDecompressionFailed.reason(
                 "reconstructed Required Insert Count is zero or exceeds the allowed range",
             ));
         }
         count
     };
     let sign = *input.first().ok_or_else(|| {
-        ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("field section is missing Delta Base")
+        ErrorCode::QpackDecompressionFailed.reason("field section is missing Delta Base")
     })? & 0x80
         != 0;
     let (input, delta_base) = be_prefixed_integer(input, 7)?;
@@ -278,7 +278,7 @@ pub(crate) fn be_field_section_prefix(
     }
     .filter(|&base| base <= VARINT_MAX)
     .ok_or_else(|| {
-        ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("Delta Base produces an invalid Base")
+        ErrorCode::QpackDecompressionFailed.reason("Delta Base produces an invalid Base")
     })?;
     Ok((
         input,
@@ -292,7 +292,7 @@ pub(crate) fn be_field_section_prefix(
 /// Parse one field-line representation and retain the unconsumed suffix.
 pub(crate) fn be_field_line(input: &[u8]) -> Result<(&[u8], FieldLine)> {
     let first = *input.first().ok_or_else(|| {
-        ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("field line is missing its first byte")
+        ErrorCode::QpackDecompressionFailed.reason("field line is missing its first byte")
     })?;
     if first & 0x80 != 0 {
         let (input, index) = be_prefixed_integer(input, 6)?;
@@ -438,7 +438,7 @@ mod tests {
         };
         assert_eq!(
             invalid.dynamic_index(prefix).unwrap_err().code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
     }
 
@@ -474,14 +474,14 @@ mod tests {
                 .dynamic_index(prefix)
                 .unwrap_err()
                 .code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
         assert_eq!(
             FieldLine::IndexedPostBase { index: 0 }
                 .resolve(prefix, &DynamicTable::new(128).unwrap())
                 .unwrap_err()
                 .code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
         assert_eq!(
             FieldLine::Indexed {
@@ -491,7 +491,7 @@ mod tests {
             .resolve(prefix, &table)
             .unwrap_err()
             .code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
     }
 
@@ -525,32 +525,32 @@ mod tests {
                     .put_field_section_prefix(&prefix, capacity)
                     .unwrap_err()
                     .code,
-                ErrorCode::QPACK_DECOMPRESSION_FAILED
+                ErrorCode::QpackDecompressionFailed
             );
         }
         assert_eq!(
             be_field_section_prefix(&[0, 0], VARINT_MAX + 1, 0)
                 .unwrap_err()
                 .code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
         assert_eq!(
             be_field_section_prefix(&[0], 128, 0).unwrap_err().code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
         assert_eq!(
             be_field_section_prefix(&[3, 0], 32, 0).unwrap_err().code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
         assert_eq!(
             be_field_section_prefix(&[0, 0xff], 128, 0)
                 .unwrap_err()
                 .code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
         assert_eq!(
             be_field_line(&[]).unwrap_err().code,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED
+            ErrorCode::QpackDecompressionFailed
         );
     }
 }

@@ -24,28 +24,33 @@ pub(crate) enum H3Stream<T> {
     Idle(T),
     Polling(T, Waker),
     Finished(T),
+    Terminated,
     Transition,
 }
 
 impl<T> H3Stream<T> {
     fn is_finished(&self) -> bool {
-        matches!(self, Self::Finished(_))
+        matches!(self, Self::Finished(_) | Self::Terminated)
     }
 
     fn terminate(&mut self, f: impl FnOnce(&mut T)) -> Option<Waker> {
         match mem::replace(self, Self::Transition) {
             Self::Idle(mut io) => {
                 f(&mut io);
-                *self = Self::Finished(io);
+                *self = Self::Terminated;
                 None
             }
             Self::Polling(mut io, waker) => {
                 f(&mut io);
-                *self = Self::Finished(io);
+                *self = Self::Terminated;
                 Some(waker)
             }
             finished @ Self::Finished(_) => {
                 *self = finished;
+                None
+            }
+            Self::Terminated => {
+                *self = Self::Terminated;
                 None
             }
             Self::Transition => unreachable!(),
@@ -55,6 +60,7 @@ impl<T> H3Stream<T> {
     fn finish(&mut self) {
         *self = match mem::replace(self, Self::Transition) {
             Self::Idle(io) | Self::Polling(io, _) | Self::Finished(io) => Self::Finished(io),
+            Self::Terminated => Self::Terminated,
             Self::Transition => unreachable!(),
         };
     }
@@ -70,6 +76,10 @@ impl<T> H3Stream<T> {
         let (mut io, finished) = match mem::replace(self, Self::Transition) {
             Self::Idle(io) | Self::Polling(io, _) => (io, false),
             Self::Finished(io) => (io, true),
+            Self::Terminated => {
+                *self = Self::Terminated;
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
             Self::Transition => unreachable!(),
         };
         let result = f(Pin::new(&mut io), cx);
@@ -99,15 +109,15 @@ impl<T> ArcH3Stream<T> {
 
     pub(crate) fn terminate(&self, f: impl FnOnce(&mut T)) -> bool {
         let mut state = self.0.lock().unwrap();
-        let (changed, waker) = match state.as_mut() {
-            Ok(stream) if !stream.is_finished() => (true, stream.terminate(f)),
-            _ => (false, None),
+        let waker = match state.as_mut() {
+            Ok(stream) if !stream.is_finished() => stream.terminate(f),
+            _ => return false,
         };
         drop(state);
         if let Some(waker) = waker {
             waker.wake();
         }
-        changed
+        true
     }
 
     pub(crate) fn goaway(&self, f: impl FnOnce(&mut T)) -> bool {
@@ -126,13 +136,13 @@ impl<T> ArcH3Stream<T> {
 
     pub(crate) fn finish(&self) -> bool {
         let mut state = self.0.lock().unwrap();
-        match state.as_mut() {
-            Ok(stream) if !stream.is_finished() => {
-                stream.finish();
-                true
-            }
-            _ => false,
+        if let Ok(stream) = state.as_mut()
+            && !stream.is_finished()
+        {
+            stream.finish();
+            return true;
         }
+        false
     }
 
     pub(crate) fn poll_io<O>(
@@ -146,7 +156,7 @@ impl<T> ArcH3Stream<T> {
         let mut state = self.0.lock().unwrap();
         match state.as_mut() {
             Ok(stream) => stream.poll_io(cx, f),
-            Err(Goaway) => Poll::Ready(Err(ErrorCode::H3_REQUEST_REJECTED
+            Err(Goaway) => Poll::Ready(Err(ErrorCode::RequestRejected
                 .reason("request rejected by GOAWAY")
                 .into())),
         }
@@ -162,21 +172,21 @@ mod tests {
     #[test]
     fn stream_state_transitions_cover_idle_polling_finished_and_goaway() {
         let idle = ArcH3Stream::new(1);
-        assert!(idle.terminate(|io| *io += 1));
-        assert!(!idle.terminate(|_| panic!("finished I/O is untouched")));
+        idle.terminate(|io| *io += 1);
+        idle.terminate(|_| panic!("finished I/O is untouched"));
 
         let rejected = ArcH3Stream::new(2);
         assert!(rejected.goaway(|io| *io += 1));
-        assert!(!rejected.terminate(|_| {}));
+        rejected.terminate(|_| {});
         assert!(!rejected.goaway(|_| {}));
 
         let waker = Waker::noop().clone();
         let polling = ArcH3Stream(Arc::new(Mutex::new(Ok(H3Stream::Polling(3, waker)))));
-        assert!(polling.terminate(|io| *io += 1));
+        polling.terminate(|io| *io += 1);
 
         let idle = ArcH3Stream::new(7);
-        assert!(idle.finish());
-        assert!(!idle.finish());
+        idle.finish();
+        idle.finish();
     }
 
     #[test]
@@ -218,7 +228,7 @@ mod tests {
                 .is_ready()
         );
         assert!(matches!(*state.0.lock().unwrap(), Ok(H3Stream::Idle(_))));
-        assert!(state.finish());
+        state.finish();
         assert!(
             state
                 .poll_io(&mut cx, |_, _| Poll::Ready(Ok(())))
@@ -236,9 +246,6 @@ mod tests {
         else {
             panic!("GOAWAY must reject I/O")
         };
-        assert_eq!(
-            crate::Error::from(error).code,
-            ErrorCode::H3_REQUEST_REJECTED
-        );
+        assert_eq!(crate::Error::from(error).code, ErrorCode::RequestRejected);
     }
 }

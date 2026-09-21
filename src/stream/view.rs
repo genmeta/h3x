@@ -20,7 +20,7 @@ impl Cursor {
     fn not_goaway(&self) -> Result<()> {
         match self {
             Self::Max(_) => Ok(()),
-            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED.reason("request rejected")),
+            Self::Gone(_) => Err(ErrorCode::RequestRejected.reason("request rejected")),
         }
     }
 
@@ -28,18 +28,18 @@ impl Cursor {
         match self {
             Self::Max(boundary) => {
                 if id.role() != boundary.role() || id.dir() != Dir::Bi {
-                    return Err(ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier"));
+                    return Err(ErrorCode::IdError.reason("invalid stream or push identifier"));
                 }
                 if id >= *boundary {
                     // A GOAWAY boundary must still fit in a QUIC variable integer.
                     let next = VarInt::try_from(u64::from(id) + 4).map_err(|_| {
-                        ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier")
+                        ErrorCode::IdError.reason("invalid stream or push identifier")
                     })?;
                     *boundary = StreamId::from(next);
                 }
                 Ok(())
             }
-            Self::Gone(_) => Err(ErrorCode::H3_REQUEST_REJECTED.reason("request rejected")),
+            Self::Gone(_) => Err(ErrorCode::RequestRejected.reason("request rejected")),
         }
     }
 }
@@ -119,30 +119,30 @@ mod tests {
         let wrong_direction = StreamId::new(Role::Server, Dir::Uni, 0);
         assert_eq!(
             view.accept(wrong_role).unwrap_err().code,
-            ErrorCode::H3_ID_ERROR
+            ErrorCode::IdError
         );
         assert_eq!(
             view.accept(wrong_direction).unwrap_err().code,
-            ErrorCode::H3_ID_ERROR
+            ErrorCode::IdError
         );
 
         let largest_server_bi = StreamId::from(VarInt::try_from((1_u64 << 62) - 3).unwrap());
         assert_eq!(
             view.accept(largest_server_bi).unwrap_err().code,
-            ErrorCode::H3_ID_ERROR
+            ErrorCode::IdError
         );
 
         let local = view.goaway();
         assert_eq!(view.goaway(), local);
         assert_eq!(
             view.local_not_goaway().unwrap_err().code,
-            ErrorCode::H3_REQUEST_REJECTED
+            ErrorCode::RequestRejected
         );
         assert_eq!(
             view.accept(StreamId::new(Role::Server, Dir::Bi, 0))
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_REQUEST_REJECTED
+            ErrorCode::RequestRejected
         );
         assert_eq!(view.send_goaway().await, local);
 
@@ -151,7 +151,7 @@ mod tests {
         view.recv_goway().await.unwrap();
         assert_eq!(
             view.remote_not_goway().unwrap_err().code,
-            ErrorCode::H3_REQUEST_REJECTED
+            ErrorCode::RequestRejected
         );
     }
 }

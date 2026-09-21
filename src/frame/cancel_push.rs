@@ -6,7 +6,7 @@ use qbase::{
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{EncodeSize, Frame, FrameType, GetFrameType, Write, WriteFrameType, varint::be_varint};
-use crate::{ErrorCode, Result};
+use crate::ErrorCode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CancelPush {
@@ -18,21 +18,23 @@ impl Frame<CancelPush> {
     pub(crate) async fn be_frame<T: AsyncRead + Unpin + ?Sized>(
         reader: &mut T,
         length: VarInt,
-    ) -> Result<Self> {
+    ) -> std::io::Result<Self> {
         if length.into_u64() > VarInt::MAX_SIZE as u64 {
-            return Err(ErrorCode::H3_FRAME_ERROR
-                .reason("CANCEL_PUSH payload exceeds the maximum identifier size"));
+            return Err(ErrorCode::FrameError
+                .reason("CANCEL_PUSH payload exceeds the maximum identifier size")
+                .into());
         }
         let mut payload = reader.take(length.into_u64());
-        let id = be_varint(&mut payload)
-            .await
-            .map_err(crate::Error::from_frame_io)?
-            .ok_or_else(|| {
-                ErrorCode::H3_FRAME_ERROR
-                    .reason("CANCEL_PUSH payload is missing a complete identifier")
-            })?;
+        let id = be_varint(&mut payload).await?.ok_or_else(|| {
+            std::io::Error::other(
+                ErrorCode::FrameError
+                    .reason("CANCEL_PUSH payload is missing a complete identifier"),
+            )
+        })?;
         if payload.limit() != 0 {
-            return Err(ErrorCode::H3_FRAME_ERROR.reason("CANCEL_PUSH payload has trailing bytes"));
+            return Err(ErrorCode::FrameError
+                .reason("CANCEL_PUSH payload has trailing bytes")
+                .into());
         }
         Ok(Self {
             length,

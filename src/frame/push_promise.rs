@@ -6,7 +6,7 @@ use super::{
     EncodeSize, Frame, FrameType, GetFrameType, MAX_BUFFERED_FRAME_PAYLOAD, Write, WriteFrameType,
     read_payload, varint::be_varint,
 };
-use crate::{ErrorCode, Result};
+use crate::ErrorCode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PushPromise {
@@ -17,17 +17,18 @@ pub(crate) struct PushPromise {
 pub(crate) async fn be_push_promise_frame<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
     length: VarInt,
-) -> Result<Frame<PushPromise>> {
+) -> std::io::Result<Frame<PushPromise>> {
     if length.into_u64() > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(ErrorCode::H3_EXCESSIVE_LOAD.reason("configured resource limit exceeded"));
+        return Err(ErrorCode::ExcessiveLoad
+            .reason("configured resource limit exceeded")
+            .into());
     }
     let mut payload = reader.take(length.into_u64());
-    let id = be_varint(&mut payload)
-        .await
-        .map_err(crate::Error::from_frame_io)?
-        .ok_or_else(|| {
-            ErrorCode::H3_FRAME_ERROR.reason("PUSH_PROMISE payload is missing a complete push ID")
-        })?;
+    let id = be_varint(&mut payload).await?.ok_or_else(|| {
+        std::io::Error::other(
+            ErrorCode::FrameError.reason("PUSH_PROMISE payload is missing a complete push ID"),
+        )
+    })?;
     let remaining = payload.limit();
     let fields = read_payload(&mut payload, remaining).await?;
     Ok(Frame {

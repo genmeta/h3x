@@ -1,6 +1,7 @@
 use std::{
     io,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -9,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
 use super::ArcH3Stream;
 use crate::{
-    ArcQpack, Error, ErrorCode,
+    ArcQpack, Error, ErrorCode, TransportError,
     common::{
         request::{ReadRequest, Request},
         response::{ReadResponse, Response},
@@ -20,7 +21,8 @@ use crate::{
 /// Application-owned read direction, sharing state with the connection registry.
 pub struct H3ReadStream<R: StopSending> {
     pub(super) state: ArcH3Stream<R>,
-    finish_cb: Box<dyn Fn() + Send + Sync>,
+    pub(super) finish_cb: Arc<dyn Fn() + Send + Sync>,
+    cancel_cb: Arc<dyn Fn(u64) + Send + Sync>,
     id: u64,
 }
 
@@ -29,22 +31,17 @@ impl<R: StopSending> H3ReadStream<R> {
         Self {
             id: stream_id,
             state: ArcH3Stream::new(stream),
-            finish_cb: Box::new(|| {}),
+            finish_cb: Arc::new(|| {}),
+            cancel_cb: Arc::new(|_| {}),
         }
     }
 
     pub(super) fn on_finish(&mut self, callback: impl Fn() + Send + Sync + 'static) {
-        self.finish_cb = Box::new(callback);
+        self.finish_cb = Arc::new(callback);
     }
 
-    pub(crate) fn shutdown(&self) {
-        (self.finish_cb)();
-    }
-
-    pub(crate) fn close(&self, error: Error) {
-        if self.state.terminate(|io| io.stop(error.code.as_u64())) {
-            self.shutdown();
-        }
+    pub(super) fn on_cancel(&mut self, callback: impl Fn(u64) + Send + Sync + 'static) {
+        self.cancel_cb = Arc::new(callback);
     }
 
     pub fn stream_id(&self) -> u64 {
@@ -55,7 +52,8 @@ impl<R: StopSending> H3ReadStream<R> {
 impl<R: StopSending> StopSending for &H3ReadStream<R> {
     fn stop(&mut self, error_code: u64) {
         if self.state.terminate(|io| io.stop(error_code)) {
-            self.shutdown();
+            (self.finish_cb)();
+            (self.cancel_cb)(error_code);
         }
     }
 }
@@ -80,8 +78,10 @@ impl<R: AsyncRead + StopSending + Unpin> AsyncRead for H3ReadStream<R> {
         let result = self.state.poll_io(cx, |recv, cx| recv.poll_read(cx, buf));
         let eof = matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() == before;
         let failed = matches!(&result, Poll::Ready(Err(error)) if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock));
-        if (eof || failed) && self.state.finish() {
-            self.shutdown();
+        if eof || failed {
+            if self.state.finish() {
+                (self.finish_cb)();
+            }
         }
         result
     }
@@ -89,7 +89,9 @@ impl<R: AsyncRead + StopSending + Unpin> AsyncRead for H3ReadStream<R> {
 
 impl<R: StopSending> Drop for H3ReadStream<R> {
     fn drop(&mut self) {
-        self.close(ErrorCode::H3_REQUEST_CANCELLED.reason("request cancelled"));
+        if self.state.finish() {
+            (self.finish_cb)();
+        }
     }
 }
 
@@ -98,13 +100,16 @@ pub(crate) enum NextFrame {
     Trailer(Frame<frame::Headers>),
 }
 
-impl<R: AsyncRead + StopSending + Unpin> H3ReadStream<R> {
+impl<R: AsyncRead + StopSending + TransportError + Unpin> H3ReadStream<R> {
     async fn read_frame(&mut self) -> crate::Result<Option<H3Frame>> {
-        let Some(ty) = frame::be_frame_type(self).await? else {
+        let Some(ty) = frame::be_frame_type(self).await.map_err(R::map_error)? else {
             return Ok(None);
         };
-        let length = frame::be_frame_length(self).await?;
-        frame::be_frame_payload(self, ty, length).await.map(Some)
+        let length = frame::be_frame_length(self).await.map_err(R::map_error)?;
+        frame::be_frame_payload(self, ty, length)
+            .await
+            .map(Some)
+            .map_err(R::map_error)
     }
 
     pub(crate) async fn read_headers_frame(
@@ -114,11 +119,14 @@ impl<R: AsyncRead + StopSending + Unpin> H3ReadStream<R> {
             match self.read_frame().await? {
                 Some(H3Frame::Headers(frame)) => return Ok(Some(frame)),
                 Some(H3Frame::Unknown { length, .. }) => {
-                    frame::skip_payload(self, length.into_u64()).await?;
+                    frame::skip_payload(self, length.into_u64())
+                        .await
+                        .map_err(R::map_error)?;
                 }
                 Some(_) => {
-                    return Err(ErrorCode::H3_FRAME_UNEXPECTED
-                        .reason("expected HEADERS before message body"));
+                    return Err(ErrorCode::FrameUnexpected
+                        .reason("expected HEADERS before message body")
+                        .connection());
                 }
                 None => return Ok(None),
             }
@@ -130,10 +138,10 @@ impl<R: AsyncRead + StopSending + Unpin> H3ReadStream<R> {
         trailers: bool,
     ) -> crate::Result<Option<NextFrame>> {
         if trailers {
-            return match frame::be_frame_type(self).await? {
-                Some(_) => {
-                    Err(ErrorCode::H3_FRAME_UNEXPECTED.reason("frame received after trailers"))
-                }
+            return match frame::be_frame_type(self).await.map_err(R::map_error)? {
+                Some(_) => Err(ErrorCode::FrameUnexpected
+                    .reason("frame received after trailers")
+                    .connection()),
                 None => Ok(None),
             };
         }
@@ -142,11 +150,14 @@ impl<R: AsyncRead + StopSending + Unpin> H3ReadStream<R> {
                 Some(H3Frame::Headers(frame)) => return Ok(Some(NextFrame::Trailer(frame))),
                 Some(H3Frame::Data(frame)) => return Ok(Some(NextFrame::Data(frame))),
                 Some(H3Frame::Unknown { length, .. }) => {
-                    frame::skip_payload(self, length.into_u64()).await?;
+                    frame::skip_payload(self, length.into_u64())
+                        .await
+                        .map_err(R::map_error)?;
                 }
                 Some(_) => {
-                    return Err(ErrorCode::H3_FRAME_UNEXPECTED
-                        .reason("frame is not allowed on a request stream"));
+                    return Err(ErrorCode::FrameUnexpected
+                        .reason("frame is not allowed on a request stream")
+                        .connection());
                 }
                 None => return Ok(None),
             }
@@ -156,26 +167,44 @@ impl<R: AsyncRead + StopSending + Unpin> H3ReadStream<R> {
 
 impl<R> ReadRequest for H3ReadStream<R>
 where
-    R: AsyncRead + StopSending + Unpin + Send + 'static,
+    R: AsyncRead + StopSending + TransportError + Unpin + Send + 'static,
 {
     async fn read_request(mut self, qpack: ArcQpack) -> crate::Result<Request<crate::R>> {
         let mut body = crate::ArcWndBuf::new(frame::MAX_DATA_CHUNK);
+        body.on_error_callback({
+            let state = self.state.clone();
+            let finish = self.finish_cb.clone();
+            let cancel = self.cancel_cb.clone();
+            move |error| {
+                if state.terminate(|io| io.stop(error.code.as_u64())) {
+                    finish();
+                    cancel(error.code.as_u64());
+                }
+            }
+        });
         let consumer = body.clone();
         let request = async {
             let frame = self.read_headers_frame().await?.ok_or_else(|| {
-                ErrorCode::H3_REQUEST_INCOMPLETE.reason("stream ended before request HEADERS")
+                ErrorCode::RequestIncomplete
+                    .reason("stream ended before request HEADERS")
+                    .stream()
             })?;
             let fields = qpack
                 .decode(self.stream_id(), frame.payload.field_section)
                 .await?;
-            Request::from_fields(fields, consumer)
+            Request::from_fields(fields, consumer).map_err(Error::stream)
         }
         .await
-        .map_err(|error| {
-            self.close(error.clone());
-            self.shutdown();
-            qpack.on_error(self.stream_id(), error)
+        .map_err(|failure| {
+            let failure = if failure.is_connection() {
+                qpack.on_connection_error(failure)
+            } else {
+                failure.stream()
+            };
+            self.stop(failure.code.as_u64());
+            qpack.error().unwrap_or(failure)
         })?;
+        let message_trailers = request.trailers.clone();
 
         tokio::spawn(async move {
             let result: crate::Result<()> = async {
@@ -184,41 +213,41 @@ where
                     match frame {
                         NextFrame::Data(frame) => {
                             let mut payload = (&mut self).take(frame.length.into_u64());
-                            tokio::io::copy(&mut payload, &mut body).await?;
+                            tokio::io::copy(&mut payload, &mut body)
+                                .await
+                                .map_err(R::map_error)?;
                             if payload.limit() != 0 {
-                                return Err(ErrorCode::H3_FRAME_ERROR.reason(
-                                    "DATA payload ended before the declared frame length",
-                                ));
+                                return Err(ErrorCode::FrameError
+                                    .reason("DATA payload ended before the declared frame length")
+                                    .connection());
                             }
                         }
                         NextFrame::Trailer(frame) => {
                             let fields = qpack
                                 .decode(self.stream_id(), frame.payload.field_section)
                                 .await?;
-                            for field in fields {
-                                if field.name.starts_with(b":") {
-                                    return Err(ErrorCode::H3_MESSAGE_ERROR
-                                        .reason("pseudo-header is not allowed in trailers"));
-                                }
-                                if field.name.iter().any(u8::is_ascii_uppercase) {
-                                    return Err(
-                                        ErrorCode::H3_MESSAGE_ERROR.reason("uppercase field name")
-                                    );
-                                }
-                            }
+                            message_trailers
+                                .extend_fields(fields)
+                                .map_err(Error::stream)?;
                             trailers = true;
                         }
                     }
                 }
-                body.shutdown().await?;
+                body.shutdown()
+                    .await
+                    .map_err(Error::from)
+                    .map_err(Error::stream)?;
                 Ok(())
             }
             .await;
-            if let Err(error) = result {
-                self.close(error.clone());
-                body.on_error(qpack.on_error(self.stream_id(), error));
+            if let Err(failure) = result {
+                let failure = if failure.is_connection() {
+                    qpack.on_connection_error(failure)
+                } else {
+                    failure.stream()
+                };
+                body.on_error(failure);
             }
-            self.shutdown();
         });
         Ok(request)
     }
@@ -226,7 +255,7 @@ where
 
 impl<R> ReadResponse for H3ReadStream<R>
 where
-    R: AsyncRead + StopSending + Unpin + Send + 'static,
+    R: AsyncRead + StopSending + TransportError + Unpin + Send + 'static,
 {
     async fn read_response(
         mut self,
@@ -234,17 +263,30 @@ where
         qpack: ArcQpack,
     ) -> crate::Result<Response<crate::R>> {
         let mut body = crate::ArcWndBuf::new(frame::MAX_DATA_CHUNK);
+        body.on_error_callback({
+            let state = self.state.clone();
+            let finish = self.finish_cb.clone();
+            let cancel = self.cancel_cb.clone();
+            move |error| {
+                if state.terminate(|io| io.stop(error.code.as_u64())) {
+                    finish();
+                    cancel(error.code.as_u64());
+                }
+            }
+        });
         let consumer = body.clone();
         let response = async {
             loop {
                 let frame = self.read_headers_frame().await?.ok_or_else(|| {
-                    ErrorCode::H3_REQUEST_INCOMPLETE
+                    ErrorCode::RequestIncomplete
                         .reason("stream ended before final response HEADERS")
+                        .stream()
                 })?;
                 let fields = qpack
                     .decode(self.stream_id(), frame.payload.field_section)
                     .await?;
-                let response = Response::from_fields(fields, consumer.clone())?;
+                let response =
+                    Response::from_fields(fields, consumer.clone()).map_err(Error::stream)?;
                 if response.status().is_informational() {
                     tokio::task::yield_now().await;
                     continue;
@@ -253,15 +295,20 @@ where
             }
         }
         .await
-        .map_err(|error| {
-            self.close(error.clone());
-            self.shutdown();
-            qpack.on_error(self.stream_id(), error)
+        .map_err(|failure| {
+            let failure = if failure.is_connection() {
+                qpack.on_connection_error(failure)
+            } else {
+                failure.stream()
+            };
+            self.stop(failure.code.as_u64());
+            qpack.error().unwrap_or(failure)
         })?;
 
         let body_allowed = request_method != http::Method::HEAD
             && response.status() != http::StatusCode::NO_CONTENT
             && response.status() != http::StatusCode::NOT_MODIFIED;
+        let message_trailers = response.trailers.clone();
         tokio::spawn(async move {
             let result: crate::Result<()> = async {
                 let mut trailers = false;
@@ -269,45 +316,46 @@ where
                     match frame {
                         NextFrame::Data(frame) => {
                             if !body_allowed {
-                                return Err(ErrorCode::H3_MESSAGE_ERROR
-                                    .reason("DATA is not allowed for this response"));
+                                return Err(ErrorCode::MessageError
+                                    .reason("DATA is not allowed for this response")
+                                    .stream());
                             }
                             let mut payload = (&mut self).take(frame.length.into_u64());
-                            tokio::io::copy(&mut payload, &mut body).await?;
+                            tokio::io::copy(&mut payload, &mut body)
+                                .await
+                                .map_err(R::map_error)?;
                             if payload.limit() != 0 {
-                                return Err(ErrorCode::H3_FRAME_ERROR.reason(
-                                    "DATA payload ended before the declared frame length",
-                                ));
+                                return Err(ErrorCode::FrameError
+                                    .reason("DATA payload ended before the declared frame length")
+                                    .connection());
                             }
                         }
                         NextFrame::Trailer(frame) => {
                             let fields = qpack
                                 .decode(self.stream_id(), frame.payload.field_section)
                                 .await?;
-                            for field in fields {
-                                if field.name.starts_with(b":") {
-                                    return Err(ErrorCode::H3_MESSAGE_ERROR
-                                        .reason("pseudo-header is not allowed in trailers"));
-                                }
-                                if field.name.iter().any(u8::is_ascii_uppercase) {
-                                    return Err(
-                                        ErrorCode::H3_MESSAGE_ERROR.reason("uppercase field name")
-                                    );
-                                }
-                            }
+                            message_trailers
+                                .extend_fields(fields)
+                                .map_err(Error::stream)?;
                             trailers = true;
                         }
                     }
                 }
-                body.shutdown().await?;
+                body.shutdown()
+                    .await
+                    .map_err(Error::from)
+                    .map_err(Error::stream)?;
                 Ok(())
             }
             .await;
-            if let Err(error) = result {
-                self.close(error.clone());
-                body.on_error(qpack.on_error(self.stream_id(), error));
+            if let Err(failure) = result {
+                let failure = if failure.is_connection() {
+                    qpack.on_connection_error(failure)
+                } else {
+                    failure.stream()
+                };
+                body.on_error(failure);
             }
-            self.shutdown();
         });
         Ok(response)
     }
@@ -366,6 +414,12 @@ mod tests {
         }
     }
 
+    impl TransportError for Io {
+        fn map_error(error: io::Error) -> Error {
+            Error::from_stream_io(error)
+        }
+    }
+
     fn headers(bytes: &'static [u8]) -> Vec<u8> {
         let mut wire = Vec::new();
         wire.put_frame(
@@ -418,26 +472,26 @@ mod tests {
         let mut stream = H3ReadStream::new(16, Io::new(vec![0, 0]));
         assert_eq!(
             stream.read_headers_frame().await.unwrap_err().code,
-            ErrorCode::H3_FRAME_UNEXPECTED
+            ErrorCode::FrameUnexpected
         );
         let mut stream = H3ReadStream::new(20, Io::new(vec![7, 1, 0]));
         assert_eq!(
             stream.read_next_frame(false).await.err().unwrap().code,
-            ErrorCode::H3_FRAME_UNEXPECTED
+            ErrorCode::FrameUnexpected
         );
         let mut stream = H3ReadStream::new(24, Io::new(vec![0]));
         assert_eq!(
             stream.read_next_frame(true).await.err().unwrap().code,
-            ErrorCode::H3_FRAME_UNEXPECTED
+            ErrorCode::FrameUnexpected
         );
     }
 
     #[tokio::test]
-    async fn read_completion_close_reject_and_stop_fire_finish_once() {
+    async fn read_completion_notifies_finish_once() {
         fn reject<R: StopSending>(stream: &H3ReadStream<R>) -> bool {
             stream
                 .state
-                .goaway(|io| io.stop(ErrorCode::H3_REQUEST_REJECTED.as_u64()))
+                .goaway(|io| io.stop(ErrorCode::RequestRejected.as_u64()))
         }
 
         let completed = Arc::new(AtomicUsize::new(0));
@@ -451,7 +505,7 @@ mod tests {
         stream.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"abc");
         assert_eq!(completed.load(Ordering::SeqCst), 1);
-        stream.close(ErrorCode::H3_INTERNAL_ERROR.reason("late"));
+        stream.stop(ErrorCode::InternalError.as_u64());
         assert!(!reject(&stream));
         stream.stop(9);
         assert_eq!(completed.load(Ordering::SeqCst), 1);
@@ -466,22 +520,23 @@ mod tests {
         assert_eq!(completed.load(Ordering::SeqCst), 0);
         let mut byte = [0];
         let error = rejected.read(&mut byte).await.unwrap_err();
-        assert_eq!(
-            crate::Error::from(error).code,
-            ErrorCode::H3_REQUEST_REJECTED
-        );
+        assert_eq!(crate::Error::from(error).code, ErrorCode::RequestRejected);
     }
 
     #[tokio::test]
     async fn read_request_rejects_a_stream_without_initial_headers() {
-        let stream = H3ReadStream::new(0, Io::default());
+        let completed = Arc::new(AtomicUsize::new(0));
+        let count = completed.clone();
+        let mut stream = H3ReadStream::new(0, Io::default());
+        stream.on_finish(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
         let result: crate::Result<crate::Request<crate::R>> =
             stream.read_request(crate::qpack::tests::qpack()).await;
         let Err(error) = result else {
             panic!("a message without HEADERS must fail")
         };
-        // The isolated QPACK fixture has no decoder-instruction callback, so
-        // cancelling this request is promoted to a connection-scoped error.
-        assert_eq!(error.code, ErrorCode::H3_INTERNAL_ERROR);
+        assert_eq!(error.code, ErrorCode::RequestIncomplete);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
     }
 }

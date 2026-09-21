@@ -26,7 +26,7 @@ pub(crate) async fn be_varint<T: AsyncRead + Unpin + ?Sized>(
     qbase::varint::be_varint(&encoded[..len])
         .map(|(_, value)| Some(value))
         .map_err(|_| {
-            ErrorCode::H3_FRAME_ERROR
+            ErrorCode::FrameError
                 .reason("malformed or truncated HTTP/3 frame")
                 .into()
         })

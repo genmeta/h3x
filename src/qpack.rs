@@ -101,7 +101,7 @@ impl ArcQpack {
             error = self.failed() => Err(error),
             result = async {
                 let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                    ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to create the required stream")
+                    ErrorCode::StreamCreationError.reason("unable to create the required stream")
                 })?;
                 self.write_encoder(instructions, &mut send).await
             } => result,
@@ -123,7 +123,7 @@ impl ArcQpack {
             error = self.failed() => Err(error),
             result = async {
                 let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                    ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to create the required stream")
+                    ErrorCode::StreamCreationError.reason("unable to create the required stream")
                 })?;
                 self.write_decoder(instructions, &mut send).await
             } => result,
@@ -141,13 +141,21 @@ impl ArcQpack {
         f(shared.as_mut().map_err(|error| error.clone())?)
     }
 
+    fn with_scoped_state<T>(&self, f: impl FnOnce(&mut Qpack) -> Result<T>) -> Result<T> {
+        let mut shared = self.lock().unwrap();
+        match &mut *shared {
+            Ok(state) => f(state),
+            Err(error) => Err(error.clone().connection()),
+        }
+    }
+
     pub(crate) fn error(&self) -> Option<Error> {
         self.lock().unwrap().as_ref().err().cloned()
     }
 
     fn critical_stream_error(&self) -> Error {
         self.error().unwrap_or_else(|| {
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("critical HTTP/3 stream closed")
+            ErrorCode::ClosedCriticalStream.reason("critical HTTP/3 stream closed")
         })
     }
 
@@ -179,44 +187,20 @@ impl ArcQpack {
         self.with_state(|state| state.encoder.configure(peer, max_fields))
     }
 
-    /// Fail the connection or cancel only the affected request's decoding state.
-    pub fn on_error(&self, id: u64, error: Error) -> Error {
-        // TODO: 优化这个
-        use ErrorCode::*;
-        let connection_error = match error.code {
-            H3_NO_ERROR
-            | H3_REQUEST_REJECTED
-            | H3_REQUEST_CANCELLED
-            | H3_REQUEST_INCOMPLETE
-            | H3_MESSAGE_ERROR
-            | H3_CONNECT_ERROR
-            | H3_VERSION_FALLBACK => false,
-            H3_GENERAL_PROTOCOL_ERROR
-            | H3_INTERNAL_ERROR
-            | H3_STREAM_CREATION_ERROR
-            | H3_CLOSED_CRITICAL_STREAM
-            | H3_FRAME_UNEXPECTED
-            | H3_FRAME_ERROR
-            | H3_EXCESSIVE_LOAD
-            | H3_ID_ERROR
-            | H3_SETTINGS_ERROR
-            | H3_MISSING_SETTINGS
-            | QPACK_DECOMPRESSION_FAILED
-            | QPACK_ENCODER_STREAM_ERROR
-            | QPACK_DECODER_STREAM_ERROR => true,
-        };
-        if connection_error {
-            self.on_connection_error(error)
-        } else {
-            if let Err(cancel_error) = self.cancel(id) {
-                return self.on_connection_error(cancel_error);
-            }
-            error
+    /// Cancel only the affected request's QPACK decoding state.
+    ///
+    /// Error scope is selected by the caller from the context in which the
+    /// error occurred; an HTTP/3 error code alone does not determine it.
+    pub fn on_stream_error(&self, id: u64, error: Error) -> Error {
+        if let Err(cancel_error) = self.cancel(id) {
+            return self.on_connection_error(cancel_error);
         }
+        error.stream()
     }
 
     /// Atomically fail both directions, preserving the first error.
     pub(crate) fn on_connection_error(&self, error: Error) -> Error {
+        let error = error.connection();
         let mut qpack = {
             let mut shared = self.lock().unwrap();
             if let Err(error) = &*shared {
@@ -238,12 +222,19 @@ impl ArcQpack {
     }
 
     pub(crate) fn encode(&self, id: u64, fields: Vec<Field>) -> Result<Bytes> {
-        self.with_state(|state| state.encoder.encode(id, fields))
+        let result = self.with_scoped_state(|state| state.encoder.encode(id, fields));
+        result.map_err(|error| {
+            if error.is_connection() {
+                self.on_connection_error(error)
+            } else {
+                error
+            }
+        })
     }
 
     pub(crate) async fn decode(&self, id: u64, payload: Bytes) -> Result<Vec<Field>> {
         self.decode_fields(id, payload).await.map_err(|error| {
-            if error.code == ErrorCode::QPACK_DECOMPRESSION_FAILED {
+            if error.is_connection() {
                 self.on_connection_error(error)
             } else {
                 error
@@ -252,18 +243,22 @@ impl ArcQpack {
     }
 
     async fn decode_fields(&self, id: u64, payload: Bytes) -> Result<Vec<Field>> {
-        let (offset, prefix) = self.with_state(|state| state.decoder.begin_decode(id, &payload))?;
+        let (offset, prefix) =
+            self.with_scoped_state(|state| state.decoder.begin_decode(id, &payload))?;
         let _decoding = StreamDecoder {
             qpack: self,
             stream_id: id,
         };
         poll_fn(|cx| {
-            self.with_state(|state| {
-                Ok(state
-                    .decoder
-                    .poll_registered_decode(id, prefix, &payload[offset..], cx))
-            })
-            .unwrap_or_else(|error| Poll::Ready(Err(error)))
+            let mut shared = self.lock().unwrap();
+            match &mut *shared {
+                Ok(state) => {
+                    state
+                        .decoder
+                        .poll_registered_decode(id, prefix, &payload[offset..], cx)
+                }
+                Err(error) => Poll::Ready(Err(error.clone().connection())),
+            }
         })
         .await
     }
@@ -308,14 +303,14 @@ impl ArcQpack {
         writer
             .write_all(&[StreamType::QpackEncoder as u8])
             .await
-            .map_err(|error| crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM))?;
+            .map_err(|error| crate::Error::from_io(error, ErrorCode::ClosedCriticalStream))?;
         let mut buf = Vec::new();
         while let Some(batch) = instructions.recv().await {
             for instruction in batch {
                 buf.clear();
                 buf.put_encoder_instruction(&instruction)?;
                 writer.write_all(&buf).await.map_err(|error| {
-                    crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM)
+                    crate::Error::from_io(error, ErrorCode::ClosedCriticalStream)
                 })?;
                 if !matches!(instruction, EncoderInstruction::SetDynamicTableCapacity(_)) {
                     self.with_state(|state| {
@@ -336,14 +331,14 @@ impl ArcQpack {
         writer
             .write_all(&[StreamType::QpackDecoder as u8])
             .await
-            .map_err(|error| crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM))?;
+            .map_err(|error| crate::Error::from_io(error, ErrorCode::ClosedCriticalStream))?;
         let mut buf = Vec::new();
         while let Some(batch) = receiver.recv().await {
             for instruction in batch {
                 buf.clear();
                 buf.put_decoder_instruction(&instruction)?;
                 writer.write_all(&buf).await.map_err(|error| {
-                    crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM)
+                    crate::Error::from_io(error, ErrorCode::ClosedCriticalStream)
                 })?;
             }
         }
@@ -383,10 +378,10 @@ impl Drop for StreamDecoder<'_> {
 pub(super) fn instruction_send_error<T>(error: tokio::sync::mpsc::error::TrySendError<T>) -> Error {
     match error {
         tokio::sync::mpsc::error::TrySendError::Full(_) => {
-            ErrorCode::H3_EXCESSIVE_LOAD.reason("QPACK instruction queue is full")
+            ErrorCode::ExcessiveLoad.reason("QPACK instruction queue is full")
         }
         tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("QPACK instruction receiver is closed")
+            ErrorCode::ClosedCriticalStream.reason("QPACK instruction receiver is closed")
         }
     }
 }
@@ -473,6 +468,12 @@ pub(crate) mod tests {
         fn cancel(&mut self, _: u64) {}
     }
 
+    impl crate::TransportError for TestIo {
+        fn map_error(error: io::Error) -> crate::Error {
+            crate::Error::from_stream_io(error)
+        }
+    }
+
     pub(crate) struct TestTransport {
         mode: u8,
         closes: AtomicUsize,
@@ -504,19 +505,19 @@ pub(crate) mod tests {
         }
 
         async fn accept_bi(&self) -> Result<(u64, (TestIo, TestIo))> {
-            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused"))
+            Err(ErrorCode::InternalError.reason("unused"))
         }
 
         async fn open_uni(&self) -> Result<Option<(u64, TestIo)>> {
             match self.mode {
                 0 => Ok(None),
                 1 => Ok(Some((2, TestIo))),
-                _ => Err(ErrorCode::H3_INTERNAL_ERROR.reason("open failed")),
+                _ => Err(ErrorCode::InternalError.reason("open failed")),
             }
         }
 
         async fn accept_uni(&self) -> Result<(u64, TestIo)> {
-            Err(ErrorCode::H3_INTERNAL_ERROR.reason("unused"))
+            Err(ErrorCode::InternalError.reason("unused"))
         }
 
         fn close(&self, _: String, _: u64) -> Result<()> {
@@ -581,8 +582,8 @@ pub(crate) mod tests {
         };
         tokio::task::yield_now().await;
 
-        let first = ErrorCode::QPACK_DECOMPRESSION_FAILED.reason("first");
-        let second = ErrorCode::H3_INTERNAL_ERROR.reason("second");
+        let first = ErrorCode::QpackDecompressionFailed.reason("first");
+        let second = ErrorCode::InternalError.reason("second");
         assert_eq!(qpack.on_connection_error(first.clone()).reason, "first");
         assert_eq!(qpack.on_connection_error(second).reason, "first");
         assert_eq!(waiting.await.unwrap().reason, "first");
@@ -595,57 +596,33 @@ pub(crate) mod tests {
         sender.try_send(1).unwrap();
         assert_eq!(
             instruction_send_error(sender.try_send(2).unwrap_err()).code,
-            ErrorCode::H3_EXCESSIVE_LOAD
+            ErrorCode::ExcessiveLoad
         );
         drop(receiver);
         assert_eq!(
             instruction_send_error(sender.try_send(3).unwrap_err()).code,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+            ErrorCode::ClosedCriticalStream
         );
     }
 
     #[test]
-    fn request_scoped_and_connection_scoped_errors_take_different_paths() {
-        for code in [
-            ErrorCode::H3_NO_ERROR,
-            ErrorCode::H3_REQUEST_REJECTED,
-            ErrorCode::H3_REQUEST_CANCELLED,
-            ErrorCode::H3_REQUEST_INCOMPLETE,
-            ErrorCode::H3_MESSAGE_ERROR,
-            ErrorCode::H3_CONNECT_ERROR,
-            ErrorCode::H3_VERSION_FALLBACK,
-        ] {
-            let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
-            qpack
-                .with_state(|state| {
-                    state.decoder.on_instruction(|_| Ok(()));
-                    Ok(())
-                })
-                .unwrap();
-            let error = code.reason("stream");
-            assert_eq!(qpack.on_error(0, error.clone()), error);
-            assert!(qpack.error().is_none());
-        }
-        for code in [
-            ErrorCode::H3_GENERAL_PROTOCOL_ERROR,
-            ErrorCode::H3_INTERNAL_ERROR,
-            ErrorCode::H3_STREAM_CREATION_ERROR,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM,
-            ErrorCode::H3_FRAME_UNEXPECTED,
-            ErrorCode::H3_FRAME_ERROR,
-            ErrorCode::H3_EXCESSIVE_LOAD,
-            ErrorCode::H3_ID_ERROR,
-            ErrorCode::H3_SETTINGS_ERROR,
-            ErrorCode::H3_MISSING_SETTINGS,
-            ErrorCode::QPACK_DECOMPRESSION_FAILED,
-            ErrorCode::QPACK_ENCODER_STREAM_ERROR,
-            ErrorCode::QPACK_DECODER_STREAM_ERROR,
-        ] {
-            let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
-            let error = code.reason("connection");
-            assert_eq!(qpack.on_error(0, error.clone()), error);
-            assert_eq!(qpack.error(), Some(error));
-        }
+    fn caller_selects_error_scope_independently_of_the_code() {
+        let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
+        qpack
+            .with_state(|state| {
+                state.decoder.on_instruction(|_| Ok(()));
+                Ok(())
+            })
+            .unwrap();
+        let stream_error = ErrorCode::InternalError.reason("stream").stream();
+        let stream_error = qpack.on_stream_error(0, stream_error.clone());
+        assert!(matches!(stream_error, Error::Stream(_)));
+        assert!(qpack.error().is_none());
+
+        let connection_error = ErrorCode::InternalError.reason("connection");
+        let connection_error = qpack.on_connection_error(connection_error);
+        assert!(matches!(connection_error, Error::Connection(_)));
+        assert_eq!(qpack.error(), Some(connection_error));
     }
 
     #[tokio::test]
@@ -669,7 +646,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+            ErrorCode::ClosedCriticalStream
         );
 
         let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(2);
@@ -688,10 +665,10 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+            ErrorCode::ClosedCriticalStream
         );
 
-        let failed = ErrorCode::H3_INTERNAL_ERROR.reason("already failed");
+        let failed = ErrorCode::InternalError.reason("already failed");
         qpack.on_connection_error(failed.clone());
         let (_, encoder_rx) = tokio::sync::mpsc::channel(1);
         assert_eq!(
@@ -735,7 +712,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+            ErrorCode::ClosedCriticalStream
         );
         assert!(matches!(
             feedback.lock().unwrap()[0].as_slice(),
@@ -752,7 +729,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+            ErrorCode::ClosedCriticalStream
         );
     }
 
@@ -763,8 +740,8 @@ pub(crate) mod tests {
             .decode(0, Bytes::from_static(&[0xff]))
             .await
             .unwrap_err();
-        assert_eq!(error.code, ErrorCode::QPACK_DECOMPRESSION_FAILED);
-        assert_eq!(qpack.error(), Some(error));
+        assert_eq!(error.code, ErrorCode::QpackDecompressionFailed);
+        assert_eq!(qpack.error(), Some(error.clone()));
     }
 
     #[tokio::test]
@@ -856,7 +833,7 @@ pub(crate) mod tests {
         qpack.cancel(4).unwrap();
         assert_eq!(
             decoding.await.unwrap().unwrap_err().code,
-            ErrorCode::H3_REQUEST_CANCELLED
+            ErrorCode::RequestCancelled
         );
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -867,7 +844,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+            ErrorCode::ClosedCriticalStream
         );
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(tx);
@@ -877,7 +854,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+            ErrorCode::ClosedCriticalStream
         );
         assert!(
             tokio::io::AsyncWriteExt::flush(&mut FailingWriter)
@@ -893,9 +870,9 @@ pub(crate) mod tests {
         let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
         assert_eq!(
             qpack
-                .on_error(0, ErrorCode::H3_NO_ERROR.reason("cancel"))
+                .on_stream_error(0, ErrorCode::NoError.reason("cancel"))
                 .code,
-            ErrorCode::H3_INTERNAL_ERROR
+            ErrorCode::InternalError
         );
     }
 }

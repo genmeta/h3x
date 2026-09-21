@@ -1,9 +1,10 @@
+use std::io;
+
 use bytes::{BufMut, Bytes};
 use qbase::varint::{VarInt, WriteVarInt};
 use tokio::io::AsyncRead;
 
 use super::{EncodeSize, Frame, FrameType, GetFrameType, Write, WriteFrameType, read_payload};
-use crate::Result;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Headers {
@@ -13,7 +14,7 @@ pub(crate) struct Headers {
 pub(crate) async fn be_headers_frame<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
     length: VarInt,
-) -> Result<Frame<Headers>> {
+) -> io::Result<Frame<Headers>> {
     let payload = read_payload(reader, length.into_u64()).await?;
     Ok(Frame {
         length,

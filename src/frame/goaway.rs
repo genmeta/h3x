@@ -3,7 +3,7 @@ use qbase::varint::{VarInt, WriteVarInt};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{EncodeSize, Frame, FrameType, GetFrameType, Write, WriteFrameType, varint::be_varint};
-use crate::{ErrorCode, Result};
+use crate::ErrorCode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Goaway {
@@ -13,21 +13,22 @@ pub struct Goaway {
 pub(crate) async fn be_goaway_frame<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
     length: VarInt,
-) -> Result<Frame<Goaway>> {
+) -> std::io::Result<Frame<Goaway>> {
     if length.into_u64() > VarInt::MAX_SIZE as u64 {
-        return Err(
-            ErrorCode::H3_FRAME_ERROR.reason("GOAWAY payload exceeds the maximum identifier size")
-        );
+        return Err(ErrorCode::FrameError
+            .reason("GOAWAY payload exceeds the maximum identifier size")
+            .into());
     }
     let mut payload = reader.take(length.into_u64());
-    let id = be_varint(&mut payload)
-        .await
-        .map_err(crate::Error::from_frame_io)?
-        .ok_or_else(|| {
-            ErrorCode::H3_FRAME_ERROR.reason("GOAWAY payload is missing a complete identifier")
-        })?;
+    let id = be_varint(&mut payload).await?.ok_or_else(|| {
+        std::io::Error::other(
+            ErrorCode::FrameError.reason("GOAWAY payload is missing a complete identifier"),
+        )
+    })?;
     if payload.limit() != 0 {
-        return Err(ErrorCode::H3_FRAME_ERROR.reason("GOAWAY payload has trailing bytes"));
+        return Err(ErrorCode::FrameError
+            .reason("GOAWAY payload has trailing bytes")
+            .into());
     }
     Ok(Frame {
         length,

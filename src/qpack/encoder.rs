@@ -24,8 +24,7 @@ impl Encoder {
             state: State::new(
                 peer,
                 Box::new(|_| {
-                    Err(ErrorCode::H3_INTERNAL_ERROR
-                        .reason("instruction callback is not registered"))
+                    Err(ErrorCode::InternalError.reason("instruction callback is not registered"))
                 }),
             )?,
             completed: 0,
@@ -73,7 +72,7 @@ mod state {
         should_never_index, table,
         table::DynamicTable,
     };
-    use crate::{ErrorCode, Result, frame::MAX_BUFFERED_FRAME_PAYLOAD};
+    use crate::{Error, ErrorCode, Result, frame::MAX_BUFFERED_FRAME_PAYLOAD};
 
     /// Budget for the estimated reference metadata retained until section ACKs arrive.
     const MAX_UNACKED_SECTION_METADATA_BYTES: usize = 64 * 1024;
@@ -103,7 +102,7 @@ mod state {
         /// Pass default peer settings until SETTINGS arrives; all integer limits are 62-bit.
         pub(super) fn new(peer: Settings, on_instruction: super::OnInstruction) -> Result<Self> {
             if peer.blocked_streams > VARINT_MAX {
-                return Err(ErrorCode::H3_SETTINGS_ERROR
+                return Err(ErrorCode::SettingsError
                     .reason("QPACK blocked-stream limit exceeds the QUIC variable-integer range"));
             }
             Ok(Self {
@@ -132,7 +131,7 @@ mod state {
             if peer.blocked_streams > VARINT_MAX
                 || peer.blocked_streams < self.potentially_blocked_streams() as u64
             {
-                return Err(ErrorCode::H3_SETTINGS_ERROR
+                return Err(ErrorCode::SettingsError
                     .reason("QPACK blocked-stream limit exceeds the QUIC variable-integer range"));
             }
             self.table.set_max_capacity(peer.max_table_capacity)?;
@@ -147,8 +146,9 @@ mod state {
             fields: impl IntoIterator<Item = Field>,
         ) -> Result<Bytes> {
             if stream_id > VARINT_MAX {
-                return Err(ErrorCode::H3_INTERNAL_ERROR
-                    .reason("encoded stream ID exceeds the QUIC variable-integer range"));
+                return Err(ErrorCode::InternalError
+                    .reason("encoded stream ID exceeds the QUIC variable-integer range")
+                    .stream());
             }
             let mut bounded = Vec::new();
             let mut size = 0usize;
@@ -159,8 +159,9 @@ mod state {
                     .and_then(|v| v.checked_add(32))
                     .filter(|&v| v as u64 <= self.max_field_section_size)
                     .ok_or_else(|| {
-                        ErrorCode::H3_EXCESSIVE_LOAD
+                        ErrorCode::ExcessiveLoad
                             .reason("field section exceeds the peer size limit")
+                            .stream()
                     })?;
                 field.never_index |= should_never_index(&field.name);
                 bounded.push(field);
@@ -173,14 +174,15 @@ mod state {
                 .map_or(0, VecDeque::len);
             let mut instructions = Vec::new();
             let mut queue_full = false;
-            let result = self
+            let result: Result<Bytes> = self
                 .encode_fields(stream_id, bounded.clone(), &mut instructions, true)
+                .map_err(Error::stream)
                 .and_then(|wire| {
                     if !instructions.is_empty()
                         && let Err(error) = (self.on_instruction)(instructions)
                     {
-                        queue_full = error.code == ErrorCode::H3_EXCESSIVE_LOAD;
-                        return Err(error);
+                        queue_full = error.code == ErrorCode::ExcessiveLoad;
+                        return Err(error.connection());
                     }
                     Ok(wire)
                 });
@@ -196,6 +198,7 @@ mod state {
                     }
                     if queue_full {
                         self.encode_fields(stream_id, bounded, &mut Vec::new(), false)
+                            .map_err(Error::stream)
                     } else {
                         Err(error)
                     }
@@ -326,7 +329,7 @@ mod state {
                 wire.put_field_line(&line)?;
             }
             if wire.len() > MAX_BUFFERED_FRAME_PAYLOAD {
-                return Err(ErrorCode::H3_EXCESSIVE_LOAD
+                return Err(ErrorCode::ExcessiveLoad
                     .reason("encoded field section exceeds the buffer limit"));
             }
             if required_insert_count != 0 {
@@ -360,7 +363,7 @@ mod state {
             instructions: &mut Vec<EncoderInstruction>,
         ) -> Result<bool> {
             if self.table.max_capacity() == 0 {
-                return Err(ErrorCode::QPACK_ENCODER_STREAM_ERROR
+                return Err(ErrorCode::QpackEncoderStreamError
                     .reason("cannot update a dynamic table with zero maximum capacity"));
             }
             Vec::new().put_encoder_instruction(&instruction)?; // Validate wire limits before committing any table changes.
@@ -389,15 +392,15 @@ mod state {
                         .unacked_sections_by_stream
                         .get_mut(&stream_id)
                         .ok_or_else(|| {
-                            ErrorCode::QPACK_DECODER_STREAM_ERROR
+                            ErrorCode::QpackDecoderStreamError
                                 .reason("acknowledgement refers to an unknown stream")
                         })?;
                     let section = sections.front().ok_or_else(|| {
-                        ErrorCode::QPACK_DECODER_STREAM_ERROR
+                        ErrorCode::QpackDecoderStreamError
                             .reason("acknowledgement has no outstanding field section")
                     })?;
                     if section.required_insert_count > completed_insert_count {
-                        return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR.reason(
+                        return Err(ErrorCode::QpackDecoderStreamError.reason(
                             "acknowledgement refers to inserts that have not been written",
                         ));
                     }
@@ -410,7 +413,7 @@ mod state {
                 }
                 DecoderInstruction::StreamCancellation(stream_id) => {
                     if stream_id > VARINT_MAX {
-                        return Err(ErrorCode::QPACK_DECODER_STREAM_ERROR.reason(
+                        return Err(ErrorCode::QpackDecoderStreamError.reason(
                             "cancelled stream ID exceeds the QUIC variable-integer range",
                         ));
                     }
@@ -421,7 +424,7 @@ mod state {
                         .known_received_count
                         .checked_add(increment)
                         .filter(|&count| increment != 0 && count <= completed_insert_count)
-                        .ok_or_else(|| ErrorCode::QPACK_DECODER_STREAM_ERROR.reason("insert-count increment is zero, overflows, or exceeds completed writes"))?;
+                        .ok_or_else(|| ErrorCode::QpackDecoderStreamError.reason("insert-count increment is zero, overflows, or exceeds completed writes"))?;
                 }
             }
             Ok(())
@@ -577,7 +580,7 @@ mod tests {
             .err()
             .unwrap()
             .code,
-            ErrorCode::H3_SETTINGS_ERROR
+            ErrorCode::SettingsError
         );
         assert_eq!(
             Encoder::new(Settings {
@@ -587,13 +590,13 @@ mod tests {
             .err()
             .unwrap()
             .code,
-            ErrorCode::H3_SETTINGS_ERROR
+            ErrorCode::SettingsError
         );
 
         let (mut encoder, _) = configured(64, 1);
         assert_eq!(
             encoder.encode(VARINT_MAX + 1, vec![]).unwrap_err().code,
-            ErrorCode::H3_INTERNAL_ERROR
+            ErrorCode::InternalError
         );
         encoder
             .configure(
@@ -609,14 +612,14 @@ mod tests {
                 .encode(0, vec![field(b"a", b"b", false)])
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_EXCESSIVE_LOAD
+            ErrorCode::ExcessiveLoad
         );
         assert_eq!(
             encoder
                 .on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(99))
                 .unwrap_err()
                 .code,
-            ErrorCode::QPACK_DECODER_STREAM_ERROR
+            ErrorCode::QpackDecoderStreamError
         );
         for instruction in [
             DecoderInstruction::InsertCountIncrement(0),
@@ -628,13 +631,12 @@ mod tests {
                     .on_decoder_instruction(instruction)
                     .unwrap_err()
                     .code,
-                ErrorCode::QPACK_DECODER_STREAM_ERROR
+                ErrorCode::QpackDecoderStreamError
             );
         }
 
         let (mut fallback, _) = configured(128, 1);
-        fallback
-            .on_instruction(|_| Err(ErrorCode::H3_EXCESSIVE_LOAD.reason("full instruction queue")));
+        fallback.on_instruction(|_| Err(ErrorCode::ExcessiveLoad.reason("full instruction queue")));
         assert!(
             !fallback
                 .encode(0, vec![field(b"x-fallback", b"value", false)])
@@ -643,14 +645,14 @@ mod tests {
         );
 
         fallback.on_instruction(|_| {
-            Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason("closed instruction queue"))
+            Err(ErrorCode::ClosedCriticalStream.reason("closed instruction queue"))
         });
         assert_eq!(
             fallback
                 .encode(4, vec![field(b"x-closed", b"value", false)])
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+            ErrorCode::ClosedCriticalStream
         );
     }
 
@@ -669,7 +671,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_SETTINGS_ERROR
+            ErrorCode::SettingsError
         );
 
         let before = batches.lock().unwrap().len();
@@ -696,7 +698,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_INTERNAL_ERROR
+            ErrorCode::InternalError
         );
 
         let mut literal = Encoder::new(Settings::default()).unwrap();
@@ -713,7 +715,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_EXCESSIVE_LOAD
+            ErrorCode::ExcessiveLoad
         );
 
         let (mut encoder, _) = configured(128, 1);
@@ -725,7 +727,7 @@ mod tests {
                 .on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0))
                 .unwrap_err()
                 .code,
-            ErrorCode::QPACK_DECODER_STREAM_ERROR
+            ErrorCode::QpackDecoderStreamError
         );
         encoder.record_insert_written();
         encoder
@@ -736,7 +738,7 @@ mod tests {
                 .on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0))
                 .unwrap_err()
                 .code,
-            ErrorCode::QPACK_DECODER_STREAM_ERROR
+            ErrorCode::QpackDecoderStreamError
         );
     }
 

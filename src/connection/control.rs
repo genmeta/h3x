@@ -9,18 +9,6 @@ use crate::{
     frame::{self, Control as ControlFrame, Frame, StreamType, WriteControl as _, be_control},
 };
 
-fn control_error(error: std::io::Error) -> Error {
-    let error = error
-        .get_ref()
-        .and_then(|error| error.downcast_ref::<std::sync::Arc<std::io::Error>>())
-        .map_or(&error, std::sync::Arc::as_ref);
-    error
-        .get_ref()
-        .and_then(|error| error.downcast_ref::<Error>())
-        .cloned()
-        .unwrap_or_else(|| ErrorCode::H3_CLOSED_CRITICAL_STREAM.reason(error.to_string()))
-}
-
 /// Local and peer connection settings.
 pub(super) struct Control {
     local_settings: Arc<super::Settings>,
@@ -41,7 +29,7 @@ impl Control {
             error = qpack.failed() => Err(error),
             result = async {
                 send = Some(transport.open_uni().await?.map(|(_, send)| send).ok_or_else(|| {
-                    ErrorCode::H3_STREAM_CREATION_ERROR.reason("unable to open control stream")
+                    ErrorCode::StreamCreationError.reason("unable to open control stream")
                 })?);
                 let send = send.as_mut().unwrap();
                 self.write_settings(send).await?;
@@ -71,8 +59,12 @@ impl Control {
         bytes.put_control(&ControlFrame::Settings(Frame::new(
             self.local_settings.0.clone(),
         )?));
-        send.write_all(&bytes).await.map_err(control_error)?;
-        send.flush().await.map_err(control_error)
+        send.write_all(&bytes)
+            .await
+            .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())?;
+        send.flush()
+            .await
+            .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())
     }
 
     pub(super) async fn write_goaway<W: tokio::io::AsyncWrite + Unpin>(
@@ -84,8 +76,12 @@ impl Control {
         bytes.put_control(&ControlFrame::Goaway(Frame::new(frame::Goaway {
             id: id.into(),
         })?));
-        send.write_all(&bytes).await.map_err(control_error)?;
-        send.flush().await.map_err(control_error)
+        send.write_all(&bytes)
+            .await
+            .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())?;
+        send.flush()
+            .await
+            .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())
     }
 
     pub(super) async fn receive_control<R: tokio::io::AsyncRead + Unpin>(
@@ -97,21 +93,22 @@ impl Control {
     ) -> Result<()> {
         let settings = match be_control(recv).await {
             Ok(ControlFrame::Settings(frame)) => frame.payload,
-            Err(error) if error.code != ErrorCode::H3_FRAME_UNEXPECTED => return Err(error),
+            Err(error) if error.code != ErrorCode::FrameUnexpected => return Err(error),
             Err(error) => {
-                return Err(ErrorCode::H3_MISSING_SETTINGS.reason(format!(
+                return Err(ErrorCode::MissingSettings.reason(format!(
                     "control stream did not start with SETTINGS: {error}"
                 )));
             }
             _ => {
-                return Err(ErrorCode::H3_MISSING_SETTINGS
-                    .reason("control stream did not start with SETTINGS"));
+                return Err(
+                    ErrorCode::MissingSettings.reason("control stream did not start with SETTINGS")
+                );
             }
         };
         on_settings(&settings)?;
         self.peer_settings
             .set(super::Settings(settings))
-            .map_err(|_| ErrorCode::H3_SETTINGS_ERROR.reason("peer settings already received"))?;
+            .map_err(|_| ErrorCode::SettingsError.reason("peer settings already received"))?;
 
         let mut last_goaway_id = None;
         loop {
@@ -122,32 +119,31 @@ impl Control {
                         || id.dir() != Dir::Bi
                         || last_goaway_id.is_some_and(|previous| id > previous)
                     {
-                        return Err(
-                            ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier")
-                        );
+                        return Err(ErrorCode::IdError.reason("invalid stream or push identifier"));
                     }
                     last_goaway_id = Some(id);
                     on_goaway(id)?;
                 }
                 // Server push is not supported.
                 ControlFrame::MaxPushId(_) | ControlFrame::CancelPush(_) => {
-                    return Err(ErrorCode::H3_ID_ERROR.reason("invalid stream or push identifier"));
+                    return Err(ErrorCode::IdError.reason("invalid stream or push identifier"));
                 }
                 ControlFrame::Unknown { length, .. } => {
                     let mut payload = (&mut *recv).take(length.into_u64());
                     tokio::io::copy(&mut payload, &mut tokio::io::sink())
                         .await
                         .map_err(|error| {
-                            crate::Error::from_io(error, ErrorCode::H3_CLOSED_CRITICAL_STREAM)
+                            crate::Error::from_io(error, ErrorCode::ClosedCriticalStream)
                         })?;
                     if payload.limit() != 0 {
-                        return Err(ErrorCode::H3_CLOSED_CRITICAL_STREAM
+                        return Err(ErrorCode::ClosedCriticalStream
                             .reason("control stream ended while skipping an unknown frame"));
                     }
                 }
                 _ => {
-                    return Err(ErrorCode::H3_FRAME_UNEXPECTED
-                        .reason("frame is not allowed in this context"));
+                    return Err(
+                        ErrorCode::FrameUnexpected.reason("frame is not allowed in this context")
+                    );
                 }
             }
         }
@@ -190,16 +186,23 @@ mod tests {
         drop(reader);
         assert_eq!(
             control.write_settings(&mut writer).await.unwrap_err().code,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+            ErrorCode::ClosedCriticalStream
         );
 
-        let protocol = ErrorCode::H3_INTERNAL_ERROR.reason("embedded");
+        let protocol = ErrorCode::InternalError.reason("embedded");
         assert_eq!(
-            control_error(std::io::Error::other(protocol.clone())),
+            Error::from_io(
+                std::io::Error::other(protocol.clone()),
+                ErrorCode::ClosedCriticalStream,
+            )
+            .connection(),
             protocol
         );
         let wrapped = std::io::Error::other(Arc::new(std::io::Error::other(protocol.clone())));
-        assert_eq!(control_error(wrapped), protocol);
+        assert_eq!(
+            Error::from_io(wrapped, ErrorCode::ClosedCriticalStream).connection(),
+            protocol
+        );
     }
 
     #[tokio::test]
@@ -235,7 +238,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(error.code, ErrorCode::H3_CLOSED_CRITICAL_STREAM);
+        assert_eq!(error.code, ErrorCode::ClosedCriticalStream);
         assert_eq!(*seen_settings.lock().unwrap(), 1);
         assert_eq!(*seen_goaway.lock().unwrap(), vec![8, 4]);
     }
@@ -255,7 +258,7 @@ mod tests {
                     .await
                     .unwrap_err()
                     .code,
-                ErrorCode::H3_MISSING_SETTINGS
+                ErrorCode::MissingSettings
             );
         }
 
@@ -266,7 +269,7 @@ mod tests {
                 .receive_control(
                     &mut wire.as_slice(),
                     crate::Role::Client,
-                    |_| Err(ErrorCode::H3_SETTINGS_ERROR.reason("callback")),
+                    |_| Err(ErrorCode::SettingsError.reason("callback")),
                     |_| Ok(()),
                 )
                 .await
@@ -284,7 +287,7 @@ mod tests {
                 &mut first.as_slice(),
                 crate::Role::Client,
                 |_| Ok(()),
-                |_| Err(ErrorCode::H3_ID_ERROR.reason("goaway callback")),
+                |_| Err(ErrorCode::IdError.reason("goaway callback")),
             )
             .await
             .unwrap_err();
@@ -299,7 +302,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_SETTINGS_ERROR
+            ErrorCode::SettingsError
         );
 
         for invalid in [
@@ -347,7 +350,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_CLOSED_CRITICAL_STREAM
+            ErrorCode::ClosedCriticalStream
         );
     }
 
@@ -360,7 +363,7 @@ mod tests {
         let failer = qpack.clone();
         tokio::spawn(async move {
             tokio::task::yield_now().await;
-            failer.on_connection_error(ErrorCode::H3_INTERNAL_ERROR.reason("stop"));
+            failer.on_connection_error(ErrorCode::InternalError.reason("stop"));
         });
         let transport = Arc::new(TestTransport::new(1));
         assert_eq!(
@@ -369,7 +372,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_INTERNAL_ERROR
+            ErrorCode::InternalError
         );
         assert_eq!(transport.close_count(), 1);
 
@@ -381,7 +384,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            ErrorCode::H3_STREAM_CREATION_ERROR
+            ErrorCode::StreamCreationError
         );
         assert_eq!(transport.close_count(), 1);
     }

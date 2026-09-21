@@ -1,6 +1,7 @@
 mod support;
 
-use h3x::{ErrorCode, R, ReadResponse, Response, W, WndBuf, WriteResponse};
+use h3x::{ErrorCode, R, ReadResponse, Request, Response, W, WndBuf, WriteResponse};
+use qrecovery::{recv::StopSending, send::CancelStream};
 use support::connection_pair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -46,9 +47,11 @@ async fn informational_response_and_unknown_frames_before_final_headers() {
     wire.extend(headers(&[(":status", "200"), ("content-length", "3")]));
     wire.extend([0, 3, b'a', b'b', b'c']);
     wire.extend(headers(&[("x-checksum", "ok")]));
-    let response = receive(wire).await.unwrap();
-    let body = collect(response.into_body()).await;
-    assert_eq!(body, "abc");
+    let mut response = receive(wire).await.unwrap();
+    let mut body = Vec::new();
+    response.read_to_end(&mut body).await.unwrap();
+    assert_eq!(body, b"abc");
+    assert_eq!(response.trailers()["x-checksum"], "ok");
 }
 
 #[tokio::test]
@@ -82,7 +85,7 @@ async fn data_after_trailers_is_rejected() {
         );
         assert!(matches!(
             error.code,
-            ErrorCode::H3_FRAME_UNEXPECTED | ErrorCode::H3_MESSAGE_ERROR
+            ErrorCode::FrameUnexpected | ErrorCode::MessageError
         ));
     }
 }
@@ -94,7 +97,7 @@ async fn truncated_streaming_data_error_reaches_body_consumer() {
     let response = receive(wire).await.unwrap();
     let mut body: WndBuf = response.into_body();
     let error = body.read_to_end(&mut Vec::new()).await.unwrap_err();
-    assert_eq!(h3x::Error::from(error).code, ErrorCode::H3_FRAME_ERROR);
+    assert_eq!(h3x::Error::from(error).code, ErrorCode::FrameError);
 }
 
 #[tokio::test]
@@ -153,6 +156,35 @@ async fn head_response_omits_outgoing_body() {
 }
 
 #[tokio::test]
+async fn head_response_closes_an_unconsumed_body_producer() {
+    let (client, server) = connection_pair();
+    let (_ws, rs) = client.open_bi().await.unwrap();
+    let (ws, _rs) = server.accept_bi().await.unwrap();
+    let window = WndBuf::new(1);
+    let mut producer = window.clone();
+    producer.write_all(b"x").await.unwrap();
+    let response: Response<W> = http::Response::builder().body(window).unwrap().into();
+
+    let writing = ws.write_response(response, http::Method::HEAD, server.qpack().clone());
+    let producing = async {
+        let error = producer.write_all(b"y").await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::join!(writing, producing)
+    })
+    .await
+    .expect("an omitted response body must release its producer");
+    result.unwrap();
+
+    let response = rs
+        .read_response(http::Method::HEAD, client.qpack().clone())
+        .await
+        .unwrap();
+    assert!(collect(response.into_body()).await.is_empty());
+}
+
+#[tokio::test]
 async fn oversized_streaming_body_allows_producer_to_finish() {
     let (client, server) = connection_pair();
     let (_ws, rs) = client.open_bi().await.unwrap();
@@ -198,7 +230,7 @@ async fn malformed_response_pseudo_headers_are_rejected() {
             Ok(_) => panic!("malformed response was accepted"),
             Err(error) => error,
         };
-        assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+        assert_eq!(error.code, ErrorCode::MessageError);
     }
 }
 
@@ -213,6 +245,44 @@ async fn collect(mut body: WndBuf) -> String {
     let mut bytes = Vec::new();
     body.read_to_end(&mut bytes).await.unwrap();
     String::from_utf8(bytes).unwrap()
+}
+
+#[tokio::test]
+async fn message_parts_transfer_between_io_directions_without_copying_body() {
+    let request: Request<W> = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("https://example.com/wasm")
+        .body(finished_body(b"request").await)
+        .unwrap()
+        .into();
+    request.set_trailer(
+        http::HeaderName::from_static("x-request-trailer"),
+        http::HeaderValue::from_static("preserved"),
+    );
+    let (head, body) = request.into_parts();
+    let mut request = Request::<R>::from_parts(head, body);
+    let mut bytes = Vec::new();
+    request.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(request.method(), http::Method::POST);
+    assert_eq!(bytes, b"request");
+    assert_eq!(request.trailers()["x-request-trailer"], "preserved");
+
+    let response: Response<W> = http::Response::builder()
+        .status(http::StatusCode::CREATED)
+        .body(finished_body(b"response").await)
+        .unwrap()
+        .into();
+    response.set_trailer(
+        http::HeaderName::from_static("x-response-trailer"),
+        http::HeaderValue::from_static("preserved"),
+    );
+    let (head, body) = response.into_parts();
+    let mut response = Response::<R>::from_parts(head, body);
+    bytes.clear();
+    response.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::CREATED);
+    assert_eq!(bytes, b"response");
+    assert_eq!(response.trailers()["x-response-trailer"], "preserved");
 }
 
 #[tokio::test]
@@ -233,4 +303,47 @@ async fn content_length_returns_body_before_data_arrives() {
     ws.write_all(&[0, 3, b'a', b'b', b'c']).await.unwrap();
     ws.shutdown().await.unwrap();
     assert_eq!(collect(response.into_body()).await, "abc");
+}
+
+#[tokio::test]
+async fn aborting_an_incoming_body_stops_an_idle_transport_read() {
+    let (client, server) = connection_pair();
+    let (_request_writer, rs) = client.open_bi().await.unwrap();
+    let (mut ws, _request_reader) = server.accept_bi().await.unwrap();
+    ws.write_all(&headers(&[(":status", "200")])).await.unwrap();
+
+    let mut response = rs
+        .read_response(http::Method::GET, client.qpack().clone())
+        .await
+        .unwrap();
+    response.stop(ErrorCode::RequestCancelled.as_u64());
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Err(error) = ws.write_all(&[0, 0]).await {
+                break error;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("message stop must interrupt the pending network read");
+    assert!(matches!(
+        h3x::Error::from(error).code,
+        ErrorCode::RequestCancelled | ErrorCode::InternalError
+    ));
+}
+
+#[tokio::test]
+async fn directional_messages_expose_transport_cancellation() {
+    let mut request: Request<R> =
+        Request::from_parts(http::Request::new(()).into_parts().0, WndBuf::new(1));
+    request.stop(ErrorCode::RequestCancelled.as_u64());
+    let error = request.read(&mut [0]).await.unwrap_err();
+    assert_eq!(h3x::Error::from(error).code, ErrorCode::RequestCancelled);
+
+    let mut response: Response<W> = http::Response::new(WndBuf::new(1)).into();
+    response.cancel(ErrorCode::InternalError.as_u64());
+    let error = response.write_all(b"x").await.unwrap_err();
+    assert_eq!(h3x::Error::from(error).code, ErrorCode::InternalError);
 }
