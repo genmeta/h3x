@@ -78,10 +78,8 @@ impl<R: AsyncRead + StopSending + Unpin> AsyncRead for H3ReadStream<R> {
         let result = self.state.poll_io(cx, |recv, cx| recv.poll_read(cx, buf));
         let eof = matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() == before;
         let failed = matches!(&result, Poll::Ready(Err(error)) if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock));
-        if eof || failed {
-            if self.state.finish() {
-                (self.finish_cb)();
-            }
+        if (eof || failed) && self.state.finish() {
+            (self.finish_cb)();
         }
         result
     }
@@ -138,12 +136,22 @@ impl<R: AsyncRead + StopSending + TransportError + Unpin> H3ReadStream<R> {
         trailers: bool,
     ) -> crate::Result<Option<NextFrame>> {
         if trailers {
-            return match frame::be_frame_type(self).await.map_err(R::map_error)? {
-                Some(_) => Err(ErrorCode::FrameUnexpected
-                    .reason("frame received after trailers")
-                    .connection()),
-                None => Ok(None),
-            };
+            loop {
+                match frame::be_frame_type(self).await.map_err(R::map_error)? {
+                    Some(frame::FrameType::Unknown(_)) => {
+                        let length = frame::be_frame_length(self).await.map_err(R::map_error)?;
+                        frame::skip_payload(self, length.into_u64())
+                            .await
+                            .map_err(R::map_error)?;
+                    }
+                    Some(_) => {
+                        return Err(ErrorCode::FrameUnexpected
+                            .reason("frame received after trailers")
+                            .connection());
+                    }
+                    None => return Ok(None),
+                }
+            }
         }
         loop {
             match self.read_frame().await? {
@@ -171,7 +179,7 @@ where
 {
     async fn read_request(mut self, qpack: ArcQpack) -> crate::Result<Request<crate::R>> {
         let mut body = crate::ArcWndBuf::new(frame::MAX_DATA_CHUNK);
-        body.on_error_callback({
+        body.on_error({
             let state = self.state.clone();
             let finish = self.finish_cb.clone();
             let cancel = self.cancel_cb.clone();
@@ -246,7 +254,7 @@ where
                 } else {
                     failure.stream()
                 };
-                body.on_error(failure);
+                body.error(failure);
             }
         });
         Ok(request)
@@ -263,7 +271,7 @@ where
         qpack: ArcQpack,
     ) -> crate::Result<Response<crate::R>> {
         let mut body = crate::ArcWndBuf::new(frame::MAX_DATA_CHUNK);
-        body.on_error_callback({
+        body.on_error({
             let state = self.state.clone();
             let finish = self.finish_cb.clone();
             let cancel = self.cancel_cb.clone();
@@ -331,6 +339,11 @@ where
                             }
                         }
                         NextFrame::Trailer(frame) => {
+                            if !body_allowed {
+                                return Err(ErrorCode::MessageError
+                                    .reason("trailers are not allowed for this response")
+                                    .stream());
+                            }
                             let fields = qpack
                                 .decode(self.stream_id(), frame.payload.field_section)
                                 .await?;
@@ -354,7 +367,7 @@ where
                 } else {
                     failure.stream()
                 };
-                body.on_error(failure);
+                body.error(failure);
             }
         });
         Ok(response)
@@ -469,6 +482,9 @@ mod tests {
         ));
         assert!(stream.read_next_frame(true).await.unwrap().is_none());
 
+        let mut stream = H3ReadStream::new(14, Io::new(vec![0x21, 2, b'x', b'y']));
+        assert!(stream.read_next_frame(true).await.unwrap().is_none());
+
         let mut stream = H3ReadStream::new(16, Io::new(vec![0, 0]));
         assert_eq!(
             stream.read_headers_frame().await.unwrap_err().code,
@@ -483,6 +499,12 @@ mod tests {
         assert_eq!(
             stream.read_next_frame(true).await.err().unwrap().code,
             ErrorCode::FrameUnexpected
+        );
+
+        let mut stream = H3ReadStream::new(28, Io::new(vec![0x21, 2, b'x']));
+        assert_eq!(
+            stream.read_next_frame(true).await.err().unwrap().code,
+            ErrorCode::FrameError
         );
     }
 

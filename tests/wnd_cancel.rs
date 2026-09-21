@@ -28,9 +28,13 @@ async fn cancellation_affects_all_clones_and_preserves_first_error() {
             window.stop(ErrorCode::MessageError.as_u64());
             let expected = ErrorCode::try_from(code).unwrap_or(ErrorCode::InternalError);
             let error = reader.read(&mut [0; 1]).await.unwrap_err();
-            assert_eq!(Error::from(error).code, expected);
+            let error = Error::from(error);
+            assert!(matches!(error, Error::Stream(_)));
+            assert_eq!(error.code, expected);
             let error = writer.write(b"x").await.unwrap_err();
-            assert_eq!(Error::from(error).code, expected);
+            let error = Error::from(error);
+            assert!(matches!(error, Error::Stream(_)));
+            assert_eq!(error.code, expected);
         }
     }
 }

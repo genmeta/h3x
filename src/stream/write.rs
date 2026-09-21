@@ -76,10 +76,8 @@ impl<W: AsyncWrite + CancelStream + Unpin> H3WriteStream<W> {
         let result = self.state.poll_io(cx, poll);
         let completed = finish && matches!(result, Poll::Ready(Ok(_)));
         let failed = matches!(&result, Poll::Ready(Err(error)) if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock));
-        if completed || failed {
-            if self.state.finish() {
-                (self.finish_cb)();
-            }
+        if (completed || failed) && self.state.finish() {
+            (self.finish_cb)();
         }
         result
     }
@@ -140,7 +138,7 @@ where
         }));
         let trailers = request.trailers.clone();
         let mut body = request.body;
-        body.on_error_callback({
+        body.on_error({
             let state = self.state.clone();
             let finish = self.finish_cb.clone();
             let cancel = self.cancel_cb.clone();
@@ -194,7 +192,7 @@ where
                 failure.stream()
             };
             self.cancel(failure.code.as_u64());
-            producer.on_error(failure.clone());
+            producer.error(failure.clone());
             qpack.error().unwrap_or(failure)
         })
     }
@@ -230,7 +228,7 @@ where
         }));
         let trailers = response.trailers.clone();
         let mut body = response.body;
-        body.on_error_callback({
+        body.on_error({
             let state = self.state.clone();
             let finish = self.finish_cb.clone();
             let cancel = self.cancel_cb.clone();
@@ -242,7 +240,7 @@ where
             }
         });
         let producer = body.clone();
-        let result: crate::Result<()> = async {
+        async {
             if !send_body {
                 body.shutdown()
                     .await
@@ -272,27 +270,29 @@ where
                     self.write_all(&buf[..count]).await.map_err(W::map_error)?;
                 }
             }
-            let trailer_fields = trailers.fields();
-            if !trailer_fields.is_empty() {
-                bytes.clear();
-                let field_section = qpack.encode(self.stream_id(), trailer_fields)?;
-                bytes.put_frame(
-                    &Frame::new(frame::Headers { field_section }).map_err(Error::stream)?,
-                );
-                self.write_all(&bytes).await.map_err(W::map_error)?;
+            if send_body {
+                let trailer_fields = trailers.fields();
+                if !trailer_fields.is_empty() {
+                    bytes.clear();
+                    let field_section = qpack.encode(self.stream_id(), trailer_fields)?;
+                    bytes.put_frame(
+                        &Frame::new(frame::Headers { field_section }).map_err(Error::stream)?,
+                    );
+                    self.write_all(&bytes).await.map_err(W::map_error)?;
+                }
             }
             self.shutdown().await.map_err(W::map_error)?;
             Ok::<_, Error>(())
         }
-        .await;
-        result.map_err(|failure| {
+        .await
+        .map_err(|failure| {
             let failure = if failure.is_connection() {
                 qpack.on_connection_error(failure)
             } else {
                 failure.stream()
             };
             self.cancel(failure.code.as_u64());
-            producer.on_error(failure.clone());
+            producer.error(failure.clone());
             qpack.error().unwrap_or(failure)
         })
     }

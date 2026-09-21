@@ -156,6 +156,47 @@ async fn head_response_omits_outgoing_body() {
 }
 
 #[tokio::test]
+async fn responses_without_content_omit_outgoing_trailers() {
+    for status in [http::StatusCode::NO_CONTENT, http::StatusCode::NOT_MODIFIED] {
+        let (client, server) = connection_pair();
+        let (_ws, rs) = client.open_bi().await.unwrap();
+        let (ws, _rs) = server.accept_bi().await.unwrap();
+        let response: Response<W> = http::Response::builder()
+            .status(status)
+            .body(finished_body(b"").await)
+            .unwrap()
+            .into();
+        response.set_trailer(
+            http::HeaderName::from_static("x-checksum"),
+            http::HeaderValue::from_static("not-sent"),
+        );
+
+        ws.write_response(response, http::Method::GET, server.qpack().clone())
+            .await
+            .unwrap();
+        let mut response = rs
+            .read_response(http::Method::GET, client.qpack().clone())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(response.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+        assert!(response.trailers().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn responses_without_content_reject_incoming_trailers() {
+    for status in ["204", "304"] {
+        let mut wire = headers(&[(":status", status)]);
+        wire.extend(headers(&[("x-checksum", "unexpected")]));
+        let mut response = receive(wire).await.unwrap();
+        let error = response.read_to_end(&mut Vec::new()).await.unwrap_err();
+        assert_eq!(h3x::Error::from(error).code, ErrorCode::MessageError);
+        assert!(response.trailers().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn head_response_closes_an_unconsumed_body_producer() {
     let (client, server) = connection_pair();
     let (_ws, rs) = client.open_bi().await.unwrap();
@@ -332,6 +373,47 @@ async fn aborting_an_incoming_body_stops_an_idle_transport_read() {
         h3x::Error::from(error).code,
         ErrorCode::RequestCancelled | ErrorCode::InternalError
     ));
+}
+
+#[tokio::test]
+async fn aborting_a_backpressured_body_does_not_fail_the_connection() {
+    let (client, server) = connection_pair();
+    let (_request_writer, rs) = client.open_bi().await.unwrap();
+    let (mut ws, _request_reader) = server.accept_bi().await.unwrap();
+
+    let mut wire = headers(&[(":status", "200")]);
+    // A four-byte QUIC varint encoding of 128 KiB. This is larger than both
+    // the body window and the test transport buffer, so the receiver must be
+    // blocked writing to the full body window before the sender can finish.
+    wire.extend([0, 0x80, 0x02, 0x00, 0x00]);
+    wire.resize(wire.len() + 128 * 1024, b'x');
+    let mut writing = tokio::spawn(async move { ws.write_all(&wire).await });
+
+    let mut response = rs
+        .read_response(http::Method::GET, client.qpack().clone())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut writing)
+            .await
+            .is_err(),
+        "sender should be backpressured by the full body window"
+    );
+    response.stop(ErrorCode::RequestCancelled.as_u64());
+    let error = response.read(&mut [0; 1]).await.unwrap_err();
+    assert!(matches!(h3x::Error::from(error), h3x::Error::Stream(_)));
+
+    let (_request_writer, rs) = client.open_bi().await.unwrap();
+    let (mut ws, _request_reader) = server.accept_bi().await.unwrap();
+    ws.write_all(&headers(&[(":status", "204")])).await.unwrap();
+    ws.shutdown().await.unwrap();
+    let response = rs
+        .read_response(http::Method::GET, client.qpack().clone())
+        .await
+        .expect("cancelling one body must leave the connection usable");
+    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
+
+    writing.abort();
 }
 
 #[tokio::test]

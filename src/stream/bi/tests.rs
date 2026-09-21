@@ -113,6 +113,45 @@ fn cancelling_either_direction_cancels_both_and_completes_drain() {
 }
 
 #[test]
+fn stopping_read_with_no_error_preserves_write_direction() {
+    let streams = Streams::new(Role::Server);
+    streams.lock().unwrap().accept(sid(0)).unwrap();
+    let (mut read, write, recv, send) = insert(&streams, 0);
+
+    read.stop(ErrorCode::NoError.as_u64());
+
+    {
+        let guard = streams.lock().unwrap();
+        assert!(guard.reads.is_empty());
+        assert!(guard.writes.contains_key(&0));
+    }
+    assert_eq!(recv.codes(), [ErrorCode::NoError.as_u64()]);
+    assert!(send.codes().is_empty());
+
+    drop(write);
+    assert!(streams.lock().unwrap().writes.is_empty());
+}
+
+#[test]
+fn cancelling_write_with_no_error_preserves_read_direction() {
+    let streams = Streams::new(Role::Client);
+    let (read, write, recv, send) = insert(&streams, 0);
+
+    (&write).cancel(ErrorCode::NoError.as_u64());
+
+    {
+        let guard = streams.lock().unwrap();
+        assert!(guard.reads.contains_key(&0));
+        assert!(guard.writes.is_empty());
+    }
+    assert!(recv.codes().is_empty());
+    assert_eq!(send.codes(), [ErrorCode::NoError.as_u64()]);
+
+    drop(read);
+    assert!(streams.lock().unwrap().reads.is_empty());
+}
+
+#[test]
 fn dropping_application_handles_only_unregisters_each_direction() {
     let streams = Streams::new(Role::Client);
     let clone = streams.clone();
@@ -162,7 +201,7 @@ fn local_goaway_freezes_acceptance_and_preserves_admitted_streams() {
         let mut guard = streams.lock().unwrap();
         guard.accept(sid(first + 4)).unwrap();
         guard.accept(sid(first)).unwrap();
-        let mut notification = Box::pin(guard.send_goaway());
+        let mut notification = Box::pin(guard.local_goaway());
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(notification.as_mut().poll(&mut cx).is_pending());
         guard.goaway(&qpack()).unwrap();
@@ -179,7 +218,7 @@ fn local_goaway_freezes_acceptance_and_preserves_admitted_streams() {
         assert!(guard.reads.contains_key(&(first + 4)));
         assert!(!guard.reads.contains_key(&(first + 8)));
         guard.goaway(&qpack()).unwrap();
-        let mut late = Box::pin(guard.send_goaway());
+        let mut late = Box::pin(guard.local_goaway());
         assert_eq!(late.as_mut().poll(&mut cx), Poll::Ready(sid(first + 8)));
     }
 }

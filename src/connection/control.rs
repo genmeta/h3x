@@ -2,7 +2,10 @@
 use std::sync::{Arc, OnceLock};
 
 use qbase::sid::{Dir, StreamId};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Mutex,
+};
 
 use crate::{
     Error, ErrorCode, Result,
@@ -10,34 +13,34 @@ use crate::{
 };
 
 /// Local and peer connection settings.
-pub(super) struct Control {
+pub(super) struct Control<W = tokio::io::Sink> {
     local_settings: Arc<super::Settings>,
     peer_settings: OnceLock<super::Settings>,
+    stream: Mutex<Option<W>>,
 }
 
-impl Control {
-    pub(super) async fn sync_control_with<T: crate::Transport>(
+impl<W> Control<W> {
+    pub(super) async fn open_uni_and_send_setting<T: crate::Transport<StreamWriter = W>>(
         &self,
         transport: Arc<T>,
         qpack: crate::ArcQpack,
-        local_goaway: impl Future<Output = qbase::sid::StreamId> + Send,
-    ) -> Result<()> {
-        let mut send = None;
-        // Retain the critical stream until transport close completes.
-        tokio::select! {
-            biased;
-            error = qpack.failed() => Err(error),
-            result = async {
-                send = Some(transport.open_uni().await?.map(|(_, send)| send).ok_or_else(|| {
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        async {
+            let mut send = transport
+                .open_uni()
+                .await?
+                .map(|(_, send)| send)
+                .ok_or_else(|| {
                     ErrorCode::StreamCreationError.reason("unable to open control stream")
-                })?);
-                let send = send.as_mut().unwrap();
-                self.write_settings(send).await?;
-                let id = local_goaway.await;
-                self.write_goaway(send, id).await?;
-                Err(qpack.failed().await)
-            } => result,
+                })?;
+            self.write_settings(&mut send).await?;
+            *self.stream.lock().await = Some(send);
+            Ok::<_, Error>(())
         }
+        .await
         .inspect_err(|error| {
             qpack.on_connection_error(error.clone());
             let _ = transport.close(error.reason.clone(), error.code.as_u64());
@@ -48,34 +51,44 @@ impl Control {
         Self {
             local_settings,
             peer_settings: OnceLock::new(),
+            stream: Mutex::new(None),
         }
     }
 
-    pub(super) async fn write_settings<W: tokio::io::AsyncWrite + Unpin>(
+    pub(super) async fn write_goaway(&self, id: StreamId) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut stream = self.stream.lock().await;
+        let stream = stream
+            .as_mut()
+            .ok_or_else(|| ErrorCode::InternalError.reason("local SETTINGS have not been sent"))?;
+        let mut bytes = Vec::new();
+        bytes.put_control(&ControlFrame::Goaway(Frame::new(frame::Goaway {
+            id: id.into(),
+        })?));
+        stream
+            .write_all(&bytes)
+            .await
+            .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())?;
+        stream
+            .flush()
+            .await
+            .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())
+    }
+
+    pub(super) async fn close(&self) {
+        self.stream.lock().await.take();
+    }
+
+    pub(super) async fn write_settings<S: tokio::io::AsyncWrite + Unpin>(
         &self,
-        send: &mut W,
+        send: &mut S,
     ) -> Result<()> {
         let mut bytes = vec![StreamType::Control as u8];
         bytes.put_control(&ControlFrame::Settings(Frame::new(
             self.local_settings.0.clone(),
         )?));
-        send.write_all(&bytes)
-            .await
-            .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())?;
-        send.flush()
-            .await
-            .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())
-    }
-
-    pub(super) async fn write_goaway<W: tokio::io::AsyncWrite + Unpin>(
-        &self,
-        send: &mut W,
-        id: StreamId,
-    ) -> Result<()> {
-        let mut bytes = Vec::new();
-        bytes.put_control(&ControlFrame::Goaway(Frame::new(frame::Goaway {
-            id: id.into(),
-        })?));
         send.write_all(&bytes)
             .await
             .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())?;
@@ -172,15 +185,13 @@ mod tests {
 
     #[tokio::test]
     async fn writes_settings_and_goaway_and_maps_closed_writer() {
-        let control = Control::new(Arc::new(super::super::Settings::default()));
+        let control = Control::<tokio::io::Sink>::new(Arc::new(super::super::Settings::default()));
         control
             .write_settings(&mut tokio::io::sink())
             .await
             .unwrap();
-        control
-            .write_goaway(&mut tokio::io::sink(), StreamId::from(vi(4)))
-            .await
-            .unwrap();
+        *control.stream.lock().await = Some(tokio::io::sink());
+        control.write_goaway(StreamId::from(vi(4))).await.unwrap();
 
         let (mut writer, reader) = tokio::io::duplex(1);
         drop(reader);
@@ -207,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn receive_control_accepts_settings_unknown_and_decreasing_goaway() {
-        let control = Control::new(Arc::new(super::super::Settings::default()));
+        let control = Control::<tokio::io::Sink>::new(Arc::new(super::super::Settings::default()));
         let mut wire = settings_frame();
         wire.put_control(&ControlFrame::Unknown {
             ty: vi(42),
@@ -246,7 +257,8 @@ mod tests {
     #[tokio::test]
     async fn receive_control_rejects_missing_duplicate_and_invalid_frames() {
         for wire in [vec![7, 1, 0], vec![0, 0], vec![42, 0]] {
-            let control = Control::new(Arc::new(super::super::Settings::default()));
+            let control =
+                Control::<tokio::io::Sink>::new(Arc::new(super::super::Settings::default()));
             assert_eq!(
                 control
                     .receive_control(
@@ -262,7 +274,7 @@ mod tests {
             );
         }
 
-        let control = Control::new(Arc::new(super::super::Settings::default()));
+        let control = Control::<tokio::io::Sink>::new(Arc::new(super::super::Settings::default()));
         let wire = settings_frame();
         assert_eq!(
             control
@@ -316,7 +328,8 @@ mod tests {
             ),
             ControlFrame::Settings(Frame::new(frame::Settings::default()).unwrap()),
         ] {
-            let control = Control::new(Arc::new(super::super::Settings::default()));
+            let control =
+                Control::<tokio::io::Sink>::new(Arc::new(super::super::Settings::default()));
             let mut wire = settings_frame();
             wire.put_control(&invalid);
             assert!(
@@ -332,7 +345,7 @@ mod tests {
             );
         }
 
-        let control = Control::new(Arc::new(super::super::Settings::default()));
+        let control = Control::<tokio::io::Sink>::new(Arc::new(super::super::Settings::default()));
         let mut truncated_unknown = settings_frame();
         truncated_unknown.put_control(&ControlFrame::Unknown {
             ty: vi(42),
@@ -355,32 +368,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_stream_sync_writes_until_qpack_failure_and_closes_transport() {
-        use crate::qpack::tests::TestTransport;
+    async fn control_stream_initialization_stores_writer_and_maps_failures() {
+        use crate::qpack::tests::{TestIo, TestTransport};
+
+        let control = Control::<TestIo>::new(Arc::new(super::super::Settings::default()));
+        assert_eq!(
+            control
+                .write_goaway(StreamId::from(vi(0)))
+                .await
+                .unwrap_err()
+                .reason,
+            "local SETTINGS have not been sent"
+        );
 
         let control = Control::new(Arc::new(super::super::Settings::default()));
         let qpack = crate::ArcQpack::new(&super::super::Settings::default()).unwrap();
-        let failer = qpack.clone();
-        tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            failer.on_connection_error(ErrorCode::InternalError.reason("stop"));
-        });
         let transport = Arc::new(TestTransport::new(1));
-        assert_eq!(
-            control
-                .sync_control_with(transport.clone(), qpack, async { StreamId::from(vi(0)) })
-                .await
-                .unwrap_err()
-                .code,
-            ErrorCode::InternalError
-        );
-        assert_eq!(transport.close_count(), 1);
+        control
+            .open_uni_and_send_setting(transport.clone(), qpack)
+            .await
+            .unwrap();
+        control.write_goaway(StreamId::from(vi(0))).await.unwrap();
+        assert_eq!(transport.close_count(), 0);
 
+        let control = Control::new(Arc::new(super::super::Settings::default()));
         let qpack = crate::ArcQpack::new(&super::super::Settings::default()).unwrap();
         let transport = Arc::new(TestTransport::new(0));
         assert_eq!(
             control
-                .sync_control_with(transport.clone(), qpack, async { StreamId::from(vi(0)) })
+                .open_uni_and_send_setting(transport.clone(), qpack)
                 .await
                 .unwrap_err()
                 .code,

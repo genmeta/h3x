@@ -29,7 +29,7 @@ use crate::ErrorCode::NoError;
 pub struct H3Connection<T: Transport> {
     pub(crate) transport: Arc<T>,
     qpack: ArcQpack,
-    control: Arc<control::Control>,
+    control: Arc<control::Control<T::StreamWriter>>,
     bi_streams: ArcBiStreams<T::StreamReader, T::StreamWriter>,
 }
 
@@ -69,12 +69,7 @@ impl<T: Transport> H3Connection<T> {
             let control = control.clone();
             let qpack = qpack.clone();
             let transport = transport.clone();
-            let local_goaway = bi.lock().unwrap().send_goaway();
-            async move {
-                control
-                    .sync_control_with(transport, qpack, local_goaway)
-                    .await
-            }
+            async move { control.open_uni_and_send_setting(transport, qpack).await }
         });
         let connection = Self {
             transport,
@@ -103,11 +98,11 @@ impl<T: Transport> H3Connection<T> {
         // Pending releases the lock; Ready registers the stream before GOAWAY can run.
         poll_fn(|cx| {
             let mut guard = self.bi_streams.lock().unwrap();
-            guard.remote_no_goway()?;
             let (id, (recv, send)) = ready!(opening.as_mut().poll(cx))?.ok_or_else(|| {
                 ErrorCode::StreamCreationError
                     .reason("transport cannot open a bidirectional stream")
             })?;
+            guard.remote_no_goway()?;
             let (read, write) =
                 self.bi_streams
                     .insert(&mut guard, id, recv, send, self.qpack.clone());
@@ -117,18 +112,20 @@ impl<T: Transport> H3Connection<T> {
     }
 
     /// Exchange GOAWAY and wait for admitted requests before closing the transport.
-    /// Admission freezes immediately; await the returned future to complete shutdown.
-    /// Submitted writes continue in the control task if this future is dropped.
-    /// Await completion to finish the exchange and drain requests.
+    /// Admission freezes immediately; the returned future writes and flushes GOAWAY,
+    /// then waits for the peer and admitted requests before closing the transport.
+    /// Dropping the future leaves admission frozen without completing shutdown.
     pub fn goaway(self) -> impl Future<Output = Result<()>> + Send {
         let qpack = self.qpack.clone();
-        let _ = self.bi_streams.lock().unwrap().goaway(&qpack);
+        let local_goaway = self.bi_streams.lock().unwrap().goaway(&qpack);
         async move {
             tokio::select! {
                 biased;
                 error = self.qpack.failed() => return Err(error),
                 result = async {
+                    let local_goaway = local_goaway?;
                     let remote_goaway = self.bi_streams.lock().unwrap().recv_goway();
+                    self.control.write_goaway(local_goaway).await?;
                     remote_goaway.await.map_err(|error| {
                         ErrorCode::InternalError.reason(format!("GOAWAY wait cancelled: {error}"))
                     })?;
@@ -137,12 +134,14 @@ impl<T: Transport> H3Connection<T> {
                     Ok::<_, crate::Error>(())
                 } => result?,
             }
-            self.transport.close(String::new(), NoError.as_u64())
+            let result = self.transport.close(String::new(), NoError.as_u64());
+            self.control.close().await;
+            result
         }
     }
 
     pub(crate) fn local_goaway(&self) -> impl Future<Output = ()> + Send + use<T> {
-        let notification = self.bi_streams.lock().unwrap().send_goaway();
+        let notification = self.bi_streams.lock().unwrap().local_goaway();
         async move {
             notification.await;
         }
@@ -202,6 +201,7 @@ impl<T: Transport> H3Connection<T> {
         let _ = self
             .transport
             .close(error.reason.clone(), error.code.as_u64());
+        self.control.close().await;
         self.on_terminated(error);
     }
 
@@ -389,7 +389,7 @@ mod tests {
             self.accept.lock().unwrap().take().unwrap()
         }
         async fn open_uni(&self) -> Result<Option<(u64, Io)>> {
-            Ok(None)
+            Ok(Some((2, Io::default())))
         }
         async fn accept_uni(&self) -> Result<(u64, Io)> {
             Err(ErrorCode::InternalError.reason("unused"))
@@ -492,22 +492,36 @@ mod tests {
             .bi_streams
             .lock()
             .unwrap()
-            .goaway(&qpack)
-            .unwrap();
-        local.await;
-
-        connection
-            .bi_streams
-            .lock()
-            .unwrap()
             .on_goaway(
                 qbase::sid::StreamId::new(crate::Role::Client, qbase::sid::Dir::Bi, 0),
-                qpack,
+                qpack.clone(),
             )
             .unwrap();
         let transport = connection.transport.clone();
-        connection.goaway().await.unwrap();
+        let control = connection.control.clone();
+        let control_transport = transport.clone();
+        let control_qpack = qpack.clone();
+        control
+            .open_uni_and_send_setting(control_transport, control_qpack)
+            .await
+            .unwrap();
+        let shutdown = connection.goaway();
+        local.await;
+        assert_eq!(transport.closes.load(Ordering::SeqCst), 0);
+        shutdown.await.unwrap();
         assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn goaway_before_local_settings_returns_error() {
+        let connection = connection(TestTransport::new(
+            None,
+            Err(ErrorCode::InternalError.reason("unused")),
+        ));
+        let transport = connection.transport.clone();
+        let error = connection.goaway().await.unwrap_err();
+        assert_eq!(error.reason, "local SETTINGS have not been sent");
+        assert_eq!(transport.closes.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
