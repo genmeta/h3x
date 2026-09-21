@@ -139,8 +139,8 @@ fn rejection_is_inclusive_directional_sorted_and_deduplicated() {
         .map(|id| (id, insert(&streams, id)))
         .collect();
     let mut guard = streams.lock().unwrap();
-    assert_eq!(guard.reject_from(4), [4, 8, 12]);
-    assert!(guard.reject_from(4).is_empty());
+    guard.reject_from(4, &qpack()).unwrap();
+    guard.reject_from(4, &qpack()).unwrap();
     for (id, (_, _, recv, send)) in &handles {
         let rejected = *id >= 4 && id % 4 == 0;
         assert_eq!(guard.reads.contains_key(id), !rejected);

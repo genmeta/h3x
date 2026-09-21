@@ -9,9 +9,9 @@ pub(crate) mod qpack;
 pub(crate) mod stream;
 pub(crate) mod transport;
 
-pub use common::message::{
-    Headers, Message, PesudoHeaders, ReadMeesage, ReadRequest, ReadResponse, WriteMessage,
-    WriteRequest, WriteResponse,
+pub use common::{
+    request::{ReadRequest, WriteRequest},
+    response::{ReadResponse, WriteResponse},
 };
 pub use connection::{H3Connection, Settings};
 pub use error::{Error, ErrorCode, Result};

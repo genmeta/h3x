@@ -3,8 +3,7 @@ mod support;
 use std::sync::Arc;
 
 use h3x::{
-    R, ReadMeesage, ReadRequest, ReadResponse, Request, Response, W, WndBuf, WriteMessage,
-    WriteRequest,
+    R, ReadRequest, ReadResponse, Request, Response, W, WndBuf, WriteRequest, WriteResponse,
 };
 use http::{Method, StatusCode, header};
 use support::connection_pair;
@@ -18,8 +17,8 @@ async fn content_length_request_and_response() {
     // its response to the paired `ws`.
     let serving = tokio::spawn(async move {
         let (ws, rs) = server.accept_bi().await.unwrap();
-        let request: Request<R> = rs.read_message(server.qpack().clone()).await.unwrap();
-        let method = request.method();
+        let request: Request<R> = rs.read_request(server.qpack().clone()).await.unwrap();
+        let method = request.method().clone();
 
         assert_eq!(method, Method::POST);
         assert_eq!(request.path(), "/echo");
@@ -32,7 +31,7 @@ async fn content_length_request_and_response() {
             .body(finished_body(b"world").await)
             .unwrap()
             .into();
-        ws.write_message(response, server.qpack().clone())
+        ws.write_response(response, method, server.qpack().clone())
             .await
             .unwrap();
     });
@@ -47,8 +46,8 @@ async fn content_length_request_and_response() {
         .body(finished_body(b"hello").await)
         .unwrap()
         .into();
-    let writing = ws.write_message(request, client.qpack().clone());
-    let receiving = rs.read_message(client.qpack().clone());
+    let writing = ws.write_request(request, client.qpack().clone());
+    let receiving = rs.read_response(Method::POST, client.qpack().clone());
     let ((), response): ((), Response<R>) = tokio::try_join!(writing, receiving).unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
@@ -62,7 +61,7 @@ async fn streaming_request_and_response() {
 
     let serving = tokio::spawn(async move {
         let (ws, rs) = server.accept_bi().await.unwrap();
-        let request: Request<R> = rs.read_message(server.qpack().clone()).await.unwrap();
+        let request: Request<R> = rs.read_request(server.qpack().clone()).await.unwrap();
 
         assert_eq!(request.method(), Method::POST);
         assert_eq!(request.path(), "/early-response");
@@ -78,9 +77,9 @@ async fn streaming_request_and_response() {
             .into();
 
         // Keep the handler's request-body read and response-body write in this
-        // task. `write_message` must send HEADERS while the body work waits for
+        // task. `write_response` must send HEADERS while the body work waits for
         // the client to start uploading only after it receives those HEADERS.
-        let writing = ws.write_message(response, server.qpack().clone());
+        let writing = ws.write_response(response, Method::POST, server.qpack().clone());
         let handling_body = async move {
             assert_eq!(collect(request_body).await, "hello");
             response_body.write_all(b"world").await?;
@@ -99,11 +98,11 @@ async fn streaming_request_and_response() {
         .body(request_window)
         .unwrap()
         .into();
-    let uploading = tokio::spawn(ws.write_message(request, client.qpack().clone()));
+    let uploading = tokio::spawn(ws.write_request(request, client.qpack().clone()));
 
     let response: Response<R> = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        rs.read_message(client.qpack().clone()),
+        rs.read_response(Method::POST, client.qpack().clone()),
     )
     .await
     .expect("response HEADERS must arrive before the request body is produced")
@@ -129,12 +128,12 @@ async fn websocket_over_extended_connect() {
 
     let serving = tokio::spawn(async move {
         let (ws, rs) = server.accept_bi().await.unwrap();
-        let request: Request<R> = rs.read_message(server.qpack().clone()).await.unwrap();
-        let method = request.method();
+        let request: Request<R> = rs.read_request(server.qpack().clone()).await.unwrap();
+        let method = request.method().clone();
 
         // RFC 9220 represents WebSocket as an extended CONNECT request.
         assert_eq!(method, Method::CONNECT);
-        assert_eq!(request.protocol().as_deref(), Some("websocket"));
+        assert_eq!(request.protocol(), Some("websocket"));
         assert_eq!(request.scheme(), "https");
         assert_eq!(request.path(), "/chat");
         assert_eq!(request.headers()["sec-websocket-protocol"], "chat");
@@ -150,7 +149,7 @@ async fn websocket_over_extended_connect() {
             .body(response_window)
             .unwrap()
             .into();
-        let writing = ws.write_message(response, server.qpack().clone());
+        let writing = ws.write_response(response, method, server.qpack().clone());
         let exchanging = async move {
             response_body.write_all(SERVER_FRAME).await?;
             response_body.shutdown().await.map_err(h3x::Error::from)?;
@@ -175,8 +174,11 @@ async fn websocket_over_extended_connect() {
         .into();
 
     // CONNECT data is held until the peer accepts with final 2xx HEADERS.
-    let uploading = tokio::spawn(ws.write_message(request, client.qpack().clone()));
-    let response: Response<R> = rs.read_message(client.qpack().clone()).await.unwrap();
+    let uploading = tokio::spawn(ws.write_request(request, client.qpack().clone()));
+    let response: Response<R> = rs
+        .read_response(Method::CONNECT, client.qpack().clone())
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["sec-websocket-protocol"], "chat");
     let mut response_body: WndBuf = response.into_body();
@@ -257,7 +259,7 @@ fn websocket_uri_schemes_are_normalized() {
         .unwrap()
         .into();
     request.set_protocol("websocket");
-    assert_eq!(request.protocol().as_deref(), Some("websocket"));
+    assert_eq!(request.protocol(), Some("websocket"));
     assert_eq!(request.scheme(), "https");
 }
 
@@ -278,7 +280,10 @@ async fn any_frame_after_trailers_is_rejected() {
             .unwrap();
         ws.write_all(suffix).await.unwrap();
         ws.shutdown().await.unwrap();
-        let response: Response<R> = rs.read_message(client.qpack().clone()).await.unwrap();
+        let response: Response<R> = rs
+            .read_response(Method::GET, client.qpack().clone())
+            .await
+            .unwrap();
         let error = response
             .into_body()
             .read_to_end(&mut Vec::new())
@@ -301,7 +306,10 @@ async fn trailers_followed_by_fin_are_accepted() {
         .await
         .unwrap();
     ws.shutdown().await.unwrap();
-    let response: Response<R> = rs.read_message(client.qpack().clone()).await.unwrap();
+    let response: Response<R> = rs
+        .read_response(Method::GET, client.qpack().clone())
+        .await
+        .unwrap();
     assert_eq!(
         response
             .into_body()
