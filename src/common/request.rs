@@ -199,57 +199,57 @@ impl Request<Read> {
         for field in fields {
             if !request.headers().is_empty() && field.name.starts_with(b":") {
                 return Err(
-                    ErrorCode::MessageError.reason("pseudo-header after regular header field")
+                    ErrorCode::MessageError.stream("pseudo-header after regular header field")
                 );
             }
             match field.name.as_ref() {
                 b":method" => {
                     let value = Method::from_bytes(&field.value)
-                        .map_err(|_| ErrorCode::MessageError.reason("invalid :method"))?;
+                        .map_err(|_| ErrorCode::MessageError.stream("invalid :method"))?;
                     if method.replace(value).is_some() {
-                        return Err(ErrorCode::MessageError.reason("duplicate :method"));
+                        return Err(ErrorCode::MessageError.stream("duplicate :method"));
                     }
                 }
                 b":scheme" => {
                     let value = std::str::from_utf8(&field.value)
-                        .map_err(|_| ErrorCode::MessageError.reason("invalid :scheme"))?
+                        .map_err(|_| ErrorCode::MessageError.stream("invalid :scheme"))?
                         .to_owned();
                     if scheme.replace(value).is_some() {
-                        return Err(ErrorCode::MessageError.reason("duplicate :scheme"));
+                        return Err(ErrorCode::MessageError.stream("duplicate :scheme"));
                     }
                 }
                 b":authority" => {
                     let value = std::str::from_utf8(&field.value)
-                        .map_err(|_| ErrorCode::MessageError.reason("invalid :authority"))?
+                        .map_err(|_| ErrorCode::MessageError.stream("invalid :authority"))?
                         .to_owned();
                     if authority.replace(value).is_some() {
-                        return Err(ErrorCode::MessageError.reason("duplicate :authority"));
+                        return Err(ErrorCode::MessageError.stream("duplicate :authority"));
                     }
                 }
                 b":path" => {
                     let value = std::str::from_utf8(&field.value)
-                        .map_err(|_| ErrorCode::MessageError.reason("invalid :path"))?
+                        .map_err(|_| ErrorCode::MessageError.stream("invalid :path"))?
                         .to_owned();
                     if path.replace(value).is_some() {
-                        return Err(ErrorCode::MessageError.reason("duplicate :path"));
+                        return Err(ErrorCode::MessageError.stream("duplicate :path"));
                     }
                 }
                 b":protocol" => {
                     let value = std::str::from_utf8(&field.value)
-                        .map_err(|_| ErrorCode::MessageError.reason("invalid :protocol"))?
+                        .map_err(|_| ErrorCode::MessageError.stream("invalid :protocol"))?
                         .to_owned();
                     if protocol.replace(value).is_some() {
-                        return Err(ErrorCode::MessageError.reason("duplicate :protocol"));
+                        return Err(ErrorCode::MessageError.stream("duplicate :protocol"));
                     }
                 }
                 name if name.starts_with(b":") => {
-                    return Err(ErrorCode::MessageError.reason("undefined request pseudo-header"));
+                    return Err(ErrorCode::MessageError.stream("undefined request pseudo-header"));
                 }
                 name => {
                     let name = HeaderName::from_lowercase(name)
-                        .map_err(|_| ErrorCode::MessageError.reason("invalid header name"))?;
+                        .map_err(|_| ErrorCode::MessageError.stream("invalid header name"))?;
                     let mut value = HeaderValue::from_bytes(&field.value)
-                        .map_err(|_| ErrorCode::MessageError.reason("invalid header value"))?;
+                        .map_err(|_| ErrorCode::MessageError.stream("invalid header value"))?;
                     value.set_sensitive(field.never_index);
                     request.headers_mut().append(name, value);
                 }
@@ -257,7 +257,7 @@ impl Request<Read> {
         }
 
         let method =
-            method.ok_or_else(|| ErrorCode::MessageError.reason("missing or invalid :method"))?;
+            method.ok_or_else(|| ErrorCode::MessageError.stream("missing or invalid :method"))?;
 
         let mut uri = Uri::builder();
         if let Some(scheme) = &scheme {
@@ -272,7 +272,7 @@ impl Request<Read> {
         *request.method_mut() = method;
         *request.uri_mut() = uri
             .build()
-            .map_err(|_| ErrorCode::MessageError.reason("invalid request URI"))?;
+            .map_err(|_| ErrorCode::MessageError.stream("invalid request URI"))?;
         *request.version_mut() = http::Version::HTTP_3;
         if let Some(protocol) = protocol {
             request.extensions_mut().insert(Arc::<str>::from(protocol));

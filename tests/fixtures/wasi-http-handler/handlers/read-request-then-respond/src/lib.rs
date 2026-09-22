@@ -10,36 +10,33 @@ impl wasip2::exports::http::incoming_handler::Guest for Handler {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         assert!(matches!(request.method(), Method::Post));
 
-        let body = request.consume().unwrap();
-        let mut input = body.stream().unwrap();
-        let mut request_body = Vec::new();
-        input.read_to_end(&mut request_body).unwrap();
+        let request_body = request.consume().unwrap();
+        let mut input = request_body.stream().unwrap();
+        let mut received = Vec::new();
+        input.read_to_end(&mut received).unwrap();
         drop(input);
-        let trailers = IncomingBody::finish(body);
+        let trailers = IncomingBody::finish(request_body);
         trailers.subscribe().block();
         let trailers = trailers.get().unwrap().unwrap().unwrap().unwrap();
         assert_eq!(trailers.get("x-request-trailer"), [b"preserved"]);
-        assert_eq!(
-            request_body,
-            b"hello-hello-hello-hello-hello-hello-hello-hello"
-        );
+        assert_eq!(received, b"hello-hello-hello-hello-hello-hello-hello-hello");
 
         let response = OutgoingResponse::new(Fields::new());
         response.set_status_code(201).unwrap();
-        let body = response.body().unwrap();
+        let response_body = response.body().unwrap();
         ResponseOutparam::set(response_out, Ok(response));
 
-        let mut output = body.write().unwrap();
-        output
-            .write_all(b"world-world-world-world-world-world-world-world")
-            .unwrap();
+        let mut output = response_body.write().unwrap();
+        // Separate writes deliberately exceed Wasmtime's bounded output channel.
+        for _ in 0..64 {
+            output.write_all(b"world-world-").unwrap();
+        }
         output.flush().unwrap();
         drop(output);
         let trailers = Fields::new();
-        trailers
-            .append("x-response-trailer", b"preserved")
-            .unwrap();
-        OutgoingBody::finish(body, Some(trailers)).unwrap();
+        trailers.append("x-response-trailer", b"preserved").unwrap();
+        trailers.append("x-response-trailer", b"also-preserved").unwrap();
+        OutgoingBody::finish(response_body, Some(trailers)).unwrap();
     }
 }
 

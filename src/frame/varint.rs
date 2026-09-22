@@ -27,7 +27,7 @@ pub(crate) async fn be_varint<T: AsyncRead + Unpin + ?Sized>(
         .map(|(_, value)| Some(value))
         .map_err(|_| {
             ErrorCode::FrameError
-                .reason("malformed or truncated HTTP/3 frame")
+                .connection("malformed or truncated HTTP/3 frame")
                 .into()
         })
 }

@@ -1,11 +1,15 @@
-[package]
-name = "wasi-http-handler"
+[workspace]
+members = [
+    "handlers/read-request-then-respond",
+    "handlers/respond-then-read-request",
+    "handlers/stream-response-until-cancelled",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.0.0"
 edition = "2024"
 publish = false
 
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
+[workspace.dependencies]
 wasip2 = "1.0.4"

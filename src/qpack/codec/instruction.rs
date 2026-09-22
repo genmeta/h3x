@@ -39,43 +39,42 @@ pub(crate) trait WriteInstruction {
 
 impl<B: BufMut> WriteInstruction for B {
     fn put_encoder_instruction(&mut self, instruction: &EncoderInstruction) -> Result<()> {
-        let result = match instruction {
-            EncoderInstruction::SetDynamicTableCapacity(capacity) => {
-                self.put_prefixed_integer(*capacity, 5, 0x20)
-            }
-            EncoderInstruction::Duplicate(index) => self.put_prefixed_integer(*index, 5, 0),
-            EncoderInstruction::InsertWithNameReference {
-                static_table,
-                index,
-                value,
-            } => {
-                if *static_table && super::super::table::get(*index).is_none() {
-                    return Err(ErrorCode::QpackEncoderStreamError
-                        .reason("invalid QPACK encoder instruction"));
+        let result =
+            match instruction {
+                EncoderInstruction::SetDynamicTableCapacity(capacity) => {
+                    self.put_prefixed_integer(*capacity, 5, 0x20)
                 }
-                if value.len() > MAX_BUFFERED_FRAME_PAYLOAD {
-                    return Err(
-                        ErrorCode::ExcessiveLoad.reason("configured resource limit exceeded")
-                    );
+                EncoderInstruction::Duplicate(index) => self.put_prefixed_integer(*index, 5, 0),
+                EncoderInstruction::InsertWithNameReference {
+                    static_table,
+                    index,
+                    value,
+                } => {
+                    if *static_table && super::super::table::get(*index).is_none() {
+                        return Err(ErrorCode::QpackEncoderStreamError
+                            .connection("invalid QPACK encoder instruction"));
+                    }
+                    if value.len() > MAX_BUFFERED_FRAME_PAYLOAD {
+                        return Err(ErrorCode::ExcessiveLoad
+                            .connection("configured resource limit exceeded"));
+                    }
+                    self.put_prefixed_integer(*index, 6, 0x80 | (u8::from(*static_table) << 6))
+                        .and_then(|()| self.put_string_literal(value, 8, 0))
                 }
-                self.put_prefixed_integer(*index, 6, 0x80 | (u8::from(*static_table) << 6))
-                    .and_then(|()| self.put_string_literal(value, 8, 0))
-            }
-            EncoderInstruction::InsertWithLiteralName { name, value } => {
-                if name.len() > MAX_BUFFERED_FRAME_PAYLOAD
-                    || value.len() > MAX_BUFFERED_FRAME_PAYLOAD
-                {
-                    return Err(
-                        ErrorCode::ExcessiveLoad.reason("configured resource limit exceeded")
-                    );
+                EncoderInstruction::InsertWithLiteralName { name, value } => {
+                    if name.len() > MAX_BUFFERED_FRAME_PAYLOAD
+                        || value.len() > MAX_BUFFERED_FRAME_PAYLOAD
+                    {
+                        return Err(ErrorCode::ExcessiveLoad
+                            .connection("configured resource limit exceeded"));
+                    }
+                    self.put_string_literal(name, 6, 0x40)
+                        .and_then(|()| self.put_string_literal(value, 8, 0))
                 }
-                self.put_string_literal(name, 6, 0x40)
-                    .and_then(|()| self.put_string_literal(value, 8, 0))
-            }
-        };
+            };
         result.map_err(|error| {
             ErrorCode::QpackEncoderStreamError
-                .reason(format!("invalid QPACK encoder instruction: {error}"))
+                .connection(format!("invalid QPACK encoder instruction: {error}"))
         })?;
         Ok(())
     }
@@ -85,16 +84,15 @@ impl<B: BufMut> WriteInstruction for B {
             DecoderInstruction::SectionAcknowledgment(id) => (id, 7, 0x80),
             DecoderInstruction::StreamCancellation(id) => (id, 6, 0x40),
             DecoderInstruction::InsertCountIncrement(0) => {
-                return Err(
-                    ErrorCode::QpackDecoderStreamError.reason("invalid QPACK decoder instruction")
-                );
+                return Err(ErrorCode::QpackDecoderStreamError
+                    .connection("invalid QPACK decoder instruction"));
             }
             DecoderInstruction::InsertCountIncrement(count) => (count, 6, 0),
         };
         self.put_prefixed_integer(value, bits, high)
             .map_err(|error| {
                 ErrorCode::QpackDecoderStreamError
-                    .reason(format!("invalid QPACK decoder instruction: {error}"))
+                    .connection(format!("invalid QPACK decoder instruction: {error}"))
             })?;
         Ok(())
     }
@@ -112,7 +110,7 @@ pub(crate) async fn be_encoder_instruction<R: AsyncRead + Unpin + ?Sized>(
         let static_table = first & 0x40 != 0;
         if static_table && super::super::table::get(index).is_none() {
             return Err(
-                ErrorCode::QpackEncoderStreamError.reason("invalid QPACK encoder instruction")
+                ErrorCode::QpackEncoderStreamError.connection("invalid QPACK encoder instruction")
             );
         }
         let value = be_string_literal(reader, 8).await?;
@@ -153,7 +151,7 @@ pub(crate) async fn be_decoder_instruction<R: AsyncRead + Unpin + ?Sized>(
     } else if value != 0 {
         Ok(DecoderInstruction::InsertCountIncrement(value))
     } else {
-        Err(ErrorCode::QpackDecoderStreamError.reason("invalid QPACK decoder instruction"))
+        Err(ErrorCode::QpackDecoderStreamError.connection("invalid QPACK decoder instruction"))
     }
 }
 

@@ -16,18 +16,18 @@ pub(crate) async fn be_goaway_frame<T: AsyncRead + Unpin + ?Sized>(
 ) -> std::io::Result<Frame<Goaway>> {
     if length.into_u64() > VarInt::MAX_SIZE as u64 {
         return Err(ErrorCode::FrameError
-            .reason("GOAWAY payload exceeds the maximum identifier size")
+            .connection("GOAWAY payload exceeds the maximum identifier size")
             .into());
     }
     let mut payload = reader.take(length.into_u64());
     let id = be_varint(&mut payload).await?.ok_or_else(|| {
         std::io::Error::other(
-            ErrorCode::FrameError.reason("GOAWAY payload is missing a complete identifier"),
+            ErrorCode::FrameError.connection("GOAWAY payload is missing a complete identifier"),
         )
     })?;
     if payload.limit() != 0 {
         return Err(ErrorCode::FrameError
-            .reason("GOAWAY payload has trailing bytes")
+            .connection("GOAWAY payload has trailing bytes")
             .into());
     }
     Ok(Frame {

@@ -20,13 +20,13 @@ pub(crate) async fn be_push_promise_frame<T: AsyncRead + Unpin + ?Sized>(
 ) -> std::io::Result<Frame<PushPromise>> {
     if length.into_u64() > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
         return Err(ErrorCode::ExcessiveLoad
-            .reason("configured resource limit exceeded")
+            .connection("configured resource limit exceeded")
             .into());
     }
     let mut payload = reader.take(length.into_u64());
     let id = be_varint(&mut payload).await?.ok_or_else(|| {
         std::io::Error::other(
-            ErrorCode::FrameError.reason("PUSH_PROMISE payload is missing a complete push ID"),
+            ErrorCode::FrameError.connection("PUSH_PROMISE payload is missing a complete push ID"),
         )
     })?;
     let remaining = payload.limit();

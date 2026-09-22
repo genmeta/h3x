@@ -169,8 +169,7 @@ impl ArcWndBuf {
         self.error(
             crate::ErrorCode::try_from(code)
                 .unwrap_or(crate::ErrorCode::InternalError)
-                .reason("body cancelled")
-                .stream(),
+                .stream("body cancelled"),
         );
     }
 
