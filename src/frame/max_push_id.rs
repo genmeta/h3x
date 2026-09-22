@@ -16,18 +16,19 @@ pub(crate) async fn be_max_push_id_frame<T: AsyncRead + Unpin + ?Sized>(
 ) -> std::io::Result<Frame<MaxPushId>> {
     if length.into_u64() > VarInt::MAX_SIZE as u64 {
         return Err(ErrorCode::FrameError
-            .reason("MAX_PUSH_ID payload exceeds the maximum identifier size")
+            .connection("MAX_PUSH_ID payload exceeds the maximum identifier size")
             .into());
     }
     let mut payload = reader.take(length.into_u64());
     let id = be_varint(&mut payload).await?.ok_or_else(|| {
         std::io::Error::other(
-            ErrorCode::FrameError.reason("MAX_PUSH_ID payload is missing a complete identifier"),
+            ErrorCode::FrameError
+                .connection("MAX_PUSH_ID payload is missing a complete identifier"),
         )
     })?;
     if payload.limit() != 0 {
         return Err(ErrorCode::FrameError
-            .reason("MAX_PUSH_ID payload has trailing bytes")
+            .connection("MAX_PUSH_ID payload has trailing bytes")
             .into());
     }
     Ok(Frame {

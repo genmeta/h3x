@@ -101,7 +101,7 @@ impl ArcQpack {
             error = self.failed() => Err(error),
             result = async {
                 let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                    ErrorCode::StreamCreationError.reason("unable to create the required stream")
+                    ErrorCode::StreamCreationError.connection("unable to create the required stream")
                 })?;
                 self.write_encoder(instructions, &mut send).await
             } => result,
@@ -123,7 +123,7 @@ impl ArcQpack {
             error = self.failed() => Err(error),
             result = async {
                 let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                    ErrorCode::StreamCreationError.reason("unable to create the required stream")
+                    ErrorCode::StreamCreationError.connection("unable to create the required stream")
                 })?;
                 self.write_decoder(instructions, &mut send).await
             } => result,
@@ -155,7 +155,7 @@ impl ArcQpack {
 
     fn critical_stream_error(&self) -> Error {
         self.error().unwrap_or_else(|| {
-            ErrorCode::ClosedCriticalStream.reason("critical HTTP/3 stream closed")
+            ErrorCode::ClosedCriticalStream.connection("critical HTTP/3 stream closed")
         })
     }
 
@@ -378,10 +378,10 @@ impl Drop for StreamDecoder<'_> {
 pub(super) fn instruction_send_error<T>(error: tokio::sync::mpsc::error::TrySendError<T>) -> Error {
     match error {
         tokio::sync::mpsc::error::TrySendError::Full(_) => {
-            ErrorCode::ExcessiveLoad.reason("QPACK instruction queue is full")
+            ErrorCode::ExcessiveLoad.connection("QPACK instruction queue is full")
         }
         tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-            ErrorCode::ClosedCriticalStream.reason("QPACK instruction receiver is closed")
+            ErrorCode::ClosedCriticalStream.connection("QPACK instruction receiver is closed")
         }
     }
 }
@@ -505,19 +505,19 @@ pub(crate) mod tests {
         }
 
         async fn accept_bi(&self) -> Result<(u64, (TestIo, TestIo))> {
-            Err(ErrorCode::InternalError.reason("unused"))
+            Err(ErrorCode::InternalError.connection("unused"))
         }
 
         async fn open_uni(&self) -> Result<Option<(u64, TestIo)>> {
             match self.mode {
                 0 => Ok(None),
                 1 => Ok(Some((2, TestIo))),
-                _ => Err(ErrorCode::InternalError.reason("open failed")),
+                _ => Err(ErrorCode::InternalError.connection("open failed")),
             }
         }
 
         async fn accept_uni(&self) -> Result<(u64, TestIo)> {
-            Err(ErrorCode::InternalError.reason("unused"))
+            Err(ErrorCode::InternalError.connection("unused"))
         }
 
         fn close(&self, _: String, _: u64) -> Result<()> {
@@ -582,8 +582,8 @@ pub(crate) mod tests {
         };
         tokio::task::yield_now().await;
 
-        let first = ErrorCode::QpackDecompressionFailed.reason("first");
-        let second = ErrorCode::InternalError.reason("second");
+        let first = ErrorCode::QpackDecompressionFailed.connection("first");
+        let second = ErrorCode::InternalError.connection("second");
         assert_eq!(qpack.on_connection_error(first.clone()).reason, "first");
         assert_eq!(qpack.on_connection_error(second).reason, "first");
         assert_eq!(waiting.await.unwrap().reason, "first");
@@ -614,12 +614,12 @@ pub(crate) mod tests {
                 Ok(())
             })
             .unwrap();
-        let stream_error = ErrorCode::InternalError.reason("stream").stream();
+        let stream_error = ErrorCode::InternalError.stream("stream");
         let stream_error = qpack.on_stream_error(0, stream_error.clone());
         assert!(matches!(stream_error, Error::Stream(_)));
         assert!(qpack.error().is_none());
 
-        let connection_error = ErrorCode::InternalError.reason("connection");
+        let connection_error = ErrorCode::InternalError.connection("connection");
         let connection_error = qpack.on_connection_error(connection_error);
         assert!(matches!(connection_error, Error::Connection(_)));
         assert_eq!(qpack.error(), Some(connection_error));
@@ -668,7 +668,7 @@ pub(crate) mod tests {
             ErrorCode::ClosedCriticalStream
         );
 
-        let failed = ErrorCode::InternalError.reason("already failed");
+        let failed = ErrorCode::InternalError.connection("already failed");
         qpack.on_connection_error(failed.clone());
         let (_, encoder_rx) = tokio::sync::mpsc::channel(1);
         assert_eq!(
@@ -870,7 +870,7 @@ pub(crate) mod tests {
         let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
         assert_eq!(
             qpack
-                .on_stream_error(0, ErrorCode::NoError.reason("cancel"))
+                .on_stream_error(0, ErrorCode::NoError.connection("cancel"))
                 .code,
             ErrorCode::InternalError
         );

@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicUsize;
+use std::sync::{Barrier, atomic::AtomicUsize};
 
 use futures::task::{ArcWake, waker};
 use qbase::varint::VarInt;
@@ -30,6 +30,14 @@ impl Io {
 type Streams = ArcBiStreams<Io, Io>;
 
 fn insert(streams: &Streams, id: u64) -> (H3ReadStream<Io>, H3WriteStream<Io>, Io, Io) {
+    insert_with_qpack(streams, id, qpack())
+}
+
+fn insert_with_qpack(
+    streams: &Streams,
+    id: u64,
+    qpack: ArcQpack,
+) -> (H3ReadStream<Io>, H3WriteStream<Io>, Io, Io) {
     let recv = Io::default();
     let send = Io::default();
     let (read, write) = streams.insert(
@@ -37,7 +45,7 @@ fn insert(streams: &Streams, id: u64) -> (H3ReadStream<Io>, H3WriteStream<Io>, I
         id,
         recv.clone(),
         send.clone(),
-        qpack(),
+        qpack,
     );
     (read, write, recv, send)
 }
@@ -83,6 +91,23 @@ fn empty_registry_drains_only_after_local_goaway_and_wakes_waiter() {
 }
 
 #[test]
+fn stream_opened_after_local_goaway_must_still_be_drained() {
+    let streams = Streams::new(Role::Client);
+
+    streams.lock().unwrap().goaway(&qpack()).unwrap();
+
+    // A local stream is still allowed until peer GOAWAY arrives.
+    let _active = insert(&streams, 0);
+
+    streams.lock().unwrap().on_goaway(sid(4), qpack()).unwrap();
+
+    let mut drain = streams.drain();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+    assert!(Pin::new(&mut drain).poll(&mut cx).is_pending());
+}
+
+#[test]
 fn cancelling_either_direction_cancels_both_and_completes_drain() {
     for read_first in [true, false] {
         let streams = Streams::new(Role::Server);
@@ -110,6 +135,67 @@ fn cancelling_either_direction_cancels_both_and_completes_drain() {
         assert_eq!(recv.codes(), [42]);
         assert_eq!(send.codes(), [42]);
     }
+}
+
+#[test]
+fn concurrent_direction_aborts_converge_without_duplicate_transport_cancellation() {
+    let streams = Streams::new(Role::Server);
+    streams.lock().unwrap().accept(sid(0)).unwrap();
+    let feedback = Arc::new(AtomicUsize::new(0));
+    let qpack = ArcQpack::new(&Settings::default()).unwrap();
+    qpack
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .decoder
+        .on_instruction({
+            let feedback = feedback.clone();
+            move |batch| {
+                feedback.fetch_add(batch.len(), Ordering::SeqCst);
+                Ok(())
+            }
+        });
+    let (mut read, write, recv, send) = insert_with_qpack(&streams, 0, qpack.clone());
+    let mut drain = streams.drain();
+    let wake_count = Arc::new(WakeCount::default());
+    let waker = waker(wake_count.clone());
+    let mut cx = Context::from_waker(&waker);
+    streams.lock().unwrap().goaway(&qpack).unwrap();
+    assert!(Pin::new(&mut drain).poll(&mut cx).is_pending());
+
+    let barrier = Arc::new(Barrier::new(2));
+    std::thread::scope(|scope| {
+        let read_barrier = barrier.clone();
+        scope.spawn(move || {
+            read_barrier.wait();
+            read.stop(42);
+        });
+        scope.spawn(move || {
+            barrier.wait();
+            (&write).cancel(42);
+        });
+    });
+
+    let guard = streams.lock().unwrap();
+    assert!(guard.reads.is_empty());
+    assert!(guard.writes.is_empty());
+    drop(guard);
+    assert_eq!(recv.codes(), [42]);
+    assert_eq!(send.codes(), [42]);
+    assert_eq!(wake_count.0.load(Ordering::SeqCst), 1);
+    assert!(Pin::new(&mut drain).poll(&mut cx).is_ready());
+    assert!(qpack.lock().unwrap().is_ok());
+
+    // Repeated stream-cancellation feedback remains non-fatal.
+    let feedback_before_duplicates = feedback.load(Ordering::SeqCst);
+    qpack.cancel_decode(0).unwrap();
+    qpack.cancel_decode(0).unwrap();
+    assert_eq!(
+        feedback.load(Ordering::SeqCst),
+        feedback_before_duplicates + 2
+    );
+    assert!(qpack.lock().unwrap().is_ok());
 }
 
 #[test]
@@ -168,6 +254,17 @@ fn dropping_application_handles_only_unregisters_each_direction() {
 }
 
 #[test]
+fn application_handles_do_not_keep_the_registry_alive() {
+    let streams = Streams::new(Role::Client);
+    let registry = Arc::downgrade(&streams.inner);
+    let (_read, _write, _, _) = insert(&streams, 0);
+
+    drop(streams);
+
+    assert!(registry.upgrade().is_none());
+}
+
+#[test]
 fn rejection_is_inclusive_directional_sorted_and_deduplicated() {
     let streams = Streams::new(Role::Client);
     let handles: Vec<_> = [12, 1, 0, 8, 4, 9]
@@ -189,18 +286,16 @@ fn rejection_is_inclusive_directional_sorted_and_deduplicated() {
         assert_eq!(recv.codes(), expected);
         assert_eq!(send.codes(), expected);
     }
-    drop(guard);
 }
 
 #[test]
-fn local_goaway_freezes_acceptance_and_preserves_admitted_streams() {
+fn local_goaway_freezes_acceptance_boundary_and_preserves_admitted_streams() {
     for (role, first) in [(Role::Server, 0), (Role::Client, 1)] {
         let streams = Streams::new(role);
         let _admitted = insert(&streams, first + 4);
         let _rejected = insert(&streams, first + 8);
         let mut guard = streams.lock().unwrap();
         guard.accept(sid(first + 4)).unwrap();
-        guard.accept(sid(first)).unwrap();
         let mut notification = Box::pin(guard.local_goaway());
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(notification.as_mut().poll(&mut cx).is_pending());
@@ -213,7 +308,8 @@ fn local_goaway_freezes_acceptance_and_preserves_admitted_streams() {
             guard.local_not_goway().unwrap_err().code,
             ErrorCode::RequestRejected
         );
-        assert!(guard.accept(sid(first)).is_err());
+        assert!(guard.accept(sid(first)).is_ok());
+        assert!(guard.accept(sid(first + 8)).is_err());
         assert!(guard.remote_no_goway().is_ok());
         assert!(guard.reads.contains_key(&(first + 4)));
         assert!(!guard.reads.contains_key(&(first + 8)));
@@ -256,8 +352,8 @@ fn close_clears_registries_propagates_error_and_completes_drain() {
     let mut drain = streams.drain();
     let mut guard = streams.lock().unwrap();
     guard.goaway(&qpack()).unwrap();
-    guard.close(ErrorCode::InternalError.reason("test close"));
-    guard.close(ErrorCode::InternalError.reason("repeat close"));
+    guard.close(ErrorCode::InternalError.connection("test close"));
+    guard.close(ErrorCode::InternalError.connection("repeat close"));
     assert!(guard.reads.is_empty());
     assert!(guard.writes.is_empty());
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());

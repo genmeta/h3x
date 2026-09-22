@@ -29,7 +29,8 @@ impl Decoder {
                 max_blocked_bytes,
                 max_fields,
                 Box::new(|_| {
-                    Err(ErrorCode::InternalError.reason("instruction callback is not registered"))
+                    Err(ErrorCode::InternalError
+                        .connection("instruction callback is not registered"))
                 }),
             )?,
         })
@@ -52,14 +53,10 @@ impl Decoder {
         payload: &[u8],
     ) -> Result<(usize, FieldSectionPrefix)> {
         if id > qbase::varint::VARINT_MAX {
-            return Err(ErrorCode::InternalError
-                .reason("invalid stream ID")
-                .stream());
+            return Err(ErrorCode::InternalError.stream("invalid stream ID"));
         }
         if self.state.decoding_stream.contains(&id) {
-            return Err(ErrorCode::RequestCancelled
-                .reason("request cancelled")
-                .stream());
+            return Err(ErrorCode::RequestCancelled.stream("request cancelled"));
         }
         let (rest, prefix) = self.state.read_prefix(payload)?;
         let offset = payload.len() - rest.len();
@@ -75,9 +72,7 @@ impl Decoder {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Vec<Field>>> {
         if !self.state.decoding_stream.contains(&id) {
-            return Poll::Ready(Err(ErrorCode::RequestCancelled
-                .reason("request cancelled")
-                .stream()));
+            return Poll::Ready(Err(ErrorCode::RequestCancelled.stream("request cancelled")));
         }
         let result = self.state.poll_decode(id, prefix, payload, cx);
         if result.is_ready() {
@@ -143,8 +138,9 @@ mod state {
             on_instruction: super::OnInstruction,
         ) -> Result<Self> {
             if local.blocked_streams > VARINT_MAX {
-                return Err(ErrorCode::SettingsError
-                    .reason("QPACK blocked-stream limit exceeds the QUIC variable-integer range"));
+                return Err(ErrorCode::SettingsError.connection(
+                    "QPACK blocked-stream limit exceeds the QUIC variable-integer range",
+                ));
             }
             Ok(Self {
                 table: DynamicTable::new(local.max_table_capacity)?,
@@ -164,8 +160,7 @@ mod state {
         ) -> Result<(&'a [u8], FieldSectionPrefix)> {
             if payload.len() > MAX_BUFFERED_FRAME_PAYLOAD {
                 return Err(ErrorCode::ExcessiveLoad
-                    .reason("encoded field section exceeds the buffer limit")
-                    .stream());
+                    .stream("encoded field section exceeds the buffer limit"));
             }
             let (bytes, prefix) = be_field_section_prefix(
                 payload,
@@ -175,8 +170,7 @@ mod state {
             .map_err(Error::connection)?;
             if prefix.required_insert_count != 0 && bytes.is_empty() {
                 return Err(ErrorCode::QpackDecompressionFailed
-                    .reason("nonzero Required Insert Count in an empty field section")
-                    .connection());
+                    .connection("nonzero Required Insert Count in an empty field section"));
             }
             Ok((bytes, prefix))
         }
@@ -205,13 +199,11 @@ mod state {
             // Admit a newly blocked section within the advertised and local budgets.
             if self.waiting.len() as u64 >= self.max_blocked_streams {
                 return Poll::Ready(Err(ErrorCode::QpackDecompressionFailed
-                    .reason("peer exceeded the advertised QPACK blocked-stream limit")
-                    .connection()));
+                    .connection("peer exceeded the advertised QPACK blocked-stream limit")));
             }
             if bytes.len() > self.max_blocked_bytes - self.blocked_bytes {
                 return Poll::Ready(Err(ErrorCode::ExcessiveLoad
-                    .reason("blocked field sections exceed the memory limit")
-                    .stream()));
+                    .stream("blocked field sections exceed the memory limit")));
             }
             self.waiting.insert(
                 id,
@@ -230,7 +222,7 @@ mod state {
             instruction: EncoderInstruction,
         ) -> Result<Vec<Waker>> {
             if self.table.max_capacity() == 0 {
-                return Err(ErrorCode::QpackEncoderStreamError.reason(
+                return Err(ErrorCode::QpackEncoderStreamError.connection(
                     "dynamic-table instruction received with zero maximum table capacity",
                 ));
             }
@@ -260,7 +252,7 @@ mod state {
         pub(super) fn cancel_stream(&mut self, id: u64) -> Result<Vec<Waker>> {
             if id > VARINT_MAX {
                 return Err(ErrorCode::InternalError
-                    .reason("cancelled stream ID exceeds the QUIC variable-integer range"));
+                    .connection("cancelled stream ID exceeds the QUIC variable-integer range"));
             }
             if self.table.max_capacity() != 0 {
                 self.send_feedback(DecoderInstruction::StreamCancellation(id))?;
@@ -323,16 +315,15 @@ mod state {
                     .filter(|&size| size as u64 <= self.max_field_section_size)
                     .ok_or_else(|| {
                         ErrorCode::ExcessiveLoad
-                            .reason("decoded field section exceeds the advertised size limit")
-                            .stream()
+                            .stream("decoded field section exceeds the advertised size limit")
                     })?;
                 fields.push(field);
                 input = rest;
             }
             if required_insert_count != prefix.required_insert_count {
-                return Err(ErrorCode::QpackDecompressionFailed
-                    .reason("Required Insert Count does not match the largest dynamic reference")
-                    .connection());
+                return Err(ErrorCode::QpackDecompressionFailed.connection(
+                    "Required Insert Count does not match the largest dynamic reference",
+                ));
             }
             Ok(fields)
         }
@@ -599,7 +590,7 @@ mod tests {
 
         let (mut callback_error, _) = make_decoder(1, 1024, 1024);
         callback_error
-            .on_instruction(|_| Err(ErrorCode::ClosedCriticalStream.reason("feedback closed")));
+            .on_instruction(|_| Err(ErrorCode::ClosedCriticalStream.connection("feedback closed")));
         assert_eq!(
             callback_error
                 .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {

@@ -33,6 +33,11 @@ struct WasmHttpHandler {
     proxy: Proxy,
 }
 
+struct WasmHttpResponse {
+    response: http::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+    execution: tokio::task::JoinHandle<wasmtime::Result<()>>,
+}
+
 impl WasmHttpHandler {
     async fn new() -> Self {
         let engine = Engine::default();
@@ -56,10 +61,10 @@ impl WasmHttpHandler {
     }
 
     async fn handle<B>(
-        &mut self,
+        mut self,
         scheme: types::Scheme,
         request: http::Request<B>,
-    ) -> http::Response<wasmtime_wasi_http::p2::body::HyperOutgoingBody>
+    ) -> WasmHttpResponse
     where
         B: Body<Data = bytes::Bytes> + Send + 'static,
         B::Error: Into<types::ErrorCode>,
@@ -78,12 +83,20 @@ impl WasmHttpHandler {
             .new_response_outparam(sender)
             .unwrap();
 
-        self.proxy
-            .wasi_http_incoming_handler()
-            .call_handle(&mut self.store, request, outparam)
-            .await
-            .unwrap();
-        receiver.await.unwrap().unwrap()
+        // The guest can set the response outparam and then block when its bounded
+        // outgoing-body channel fills. Drive it independently so the host can
+        // consume that body before the guest handler returns.
+        let execution = tokio::spawn(async move {
+            self.proxy
+                .wasi_http_incoming_handler()
+                .call_handle(&mut self.store, request, outparam)
+                .await
+        });
+        let response = receiver.await.unwrap().unwrap();
+        WasmHttpResponse {
+            response,
+            execution,
+        }
     }
 }
 
@@ -109,9 +122,10 @@ impl WasiHttpView for ServerState {
 #[tokio::test]
 async fn http3_and_wasi_http_stream_large_bodies_and_trailers() {
     const REQUEST_BODY: &[u8] = b"hello-hello-hello-hello-hello-hello-hello-hello";
-    const RESPONSE_BODY: &[u8] = b"world-world-world-world-world-world-world-world";
+    const RESPONSE_CHUNK: &[u8] = b"world-world-";
+    const RESPONSE_CHUNKS: usize = 64;
 
-    let mut handler = WasmHttpHandler::new().await;
+    let handler = WasmHttpHandler::new().await;
     let (client, server) = connection_pair();
     let (client_ws, client_rs) = client.open_bi().await.unwrap();
 
@@ -153,7 +167,10 @@ async fn http3_and_wasi_http_stream_large_bodies_and_trailers() {
         );
         let request = http::Request::from_parts(parts, StreamBody::new(body));
 
-        let response = handler.handle(types::Scheme::Https, request).await;
+        let WasmHttpResponse {
+            response,
+            execution,
+        } = handler.handle(types::Scheme::Https, request).await;
 
         let (parts, mut body) = response.into_parts();
         let window = ArcWndBuf::new(8);
@@ -164,7 +181,11 @@ async fn http3_and_wasi_http_stream_large_bodies_and_trailers() {
             while let Some(frame) = body.frame().await {
                 let frame = frame.unwrap();
                 match frame.into_data() {
-                    Ok(data) => response.write_all(&data).await.unwrap(),
+                    Ok(data) => {
+                        response.write_all(&data).await.unwrap();
+                        // Keep the WASI body consumer slower than the guest writer.
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
                     Err(frame) => {
                         let trailers = frame.into_trailers().unwrap();
                         for (name, value) in &trailers {
@@ -177,6 +198,8 @@ async fn http3_and_wasi_http_stream_large_bodies_and_trailers() {
         };
         let (result, ()) = tokio::join!(writing, pumping);
         result.unwrap();
+        // Retain and observe the guest task until after its body has drained.
+        execution.await.unwrap().unwrap();
     };
 
     let client_side = async move {
@@ -207,7 +230,7 @@ async fn http3_and_wasi_http_stream_large_bodies_and_trailers() {
         assert_eq!(response.status(), StatusCode::CREATED);
         let mut body = Vec::new();
         response.read_to_end(&mut body).await.unwrap();
-        assert_eq!(body, RESPONSE_BODY);
+        assert_eq!(body, RESPONSE_CHUNK.repeat(RESPONSE_CHUNKS));
         assert_eq!(response.trailers()["x-response-trailer"], "preserved");
     };
 
@@ -216,4 +239,32 @@ async fn http3_and_wasi_http_stream_large_bodies_and_trailers() {
     })
     .await
     .expect("streaming bridge must not stall when a body exceeds its window");
+}
+
+#[tokio::test]
+async fn cancelling_wasi_http_response_unblocks_guest_execution() {
+    let handler = WasmHttpHandler::new().await;
+    let body = StreamBody::new(futures::stream::empty::<
+        Result<Frame<bytes::Bytes>, types::ErrorCode>,
+    >());
+    let request = http::Request::builder()
+        .method(Method::POST)
+        .uri("https://example.com/cancel")
+        .body(body)
+        .unwrap();
+
+    let WasmHttpResponse {
+        response,
+        execution,
+    } = handler.handle(types::Scheme::Https, request).await;
+    let (_, mut body) = response.into_parts();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(!first.is_empty());
+    drop(body);
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+        .await
+        .expect("dropping the response body must unblock guest execution")
+        .unwrap()
+        .unwrap();
 }

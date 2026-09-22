@@ -21,19 +21,19 @@ impl Frame<CancelPush> {
     ) -> std::io::Result<Self> {
         if length.into_u64() > VarInt::MAX_SIZE as u64 {
             return Err(ErrorCode::FrameError
-                .reason("CANCEL_PUSH payload exceeds the maximum identifier size")
+                .connection("CANCEL_PUSH payload exceeds the maximum identifier size")
                 .into());
         }
         let mut payload = reader.take(length.into_u64());
         let id = be_varint(&mut payload).await?.ok_or_else(|| {
             std::io::Error::other(
                 ErrorCode::FrameError
-                    .reason("CANCEL_PUSH payload is missing a complete identifier"),
+                    .connection("CANCEL_PUSH payload is missing a complete identifier"),
             )
         })?;
         if payload.limit() != 0 {
             return Err(ErrorCode::FrameError
-                .reason("CANCEL_PUSH payload has trailing bytes")
+                .connection("CANCEL_PUSH payload has trailing bytes")
                 .into());
         }
         Ok(Self {

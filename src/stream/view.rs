@@ -20,26 +20,38 @@ impl Cursor {
     fn not_goaway(&self) -> Result<()> {
         match self {
             Self::Max(_) => Ok(()),
-            Self::Gone(_) => Err(ErrorCode::RequestRejected.reason("request rejected")),
+            Self::Gone(_) => Err(ErrorCode::RequestRejected.stream("request rejected")),
         }
     }
 
     fn accept(&mut self, id: StreamId) -> Result<()> {
+        let boundary = match self {
+            Self::Max(boundary) | Self::Gone(boundary) => *boundary,
+        };
+        if id.role() != boundary.role() || id.dir() != Dir::Bi {
+            return Err(ErrorCode::InternalError
+                .connection("transport returned a non-peer bidirectional stream"));
+        }
+
         match self {
             Self::Max(boundary) => {
-                if id.role() != boundary.role() || id.dir() != Dir::Bi {
-                    return Err(ErrorCode::IdError.reason("invalid stream or push identifier"));
-                }
                 if id >= *boundary {
                     // A GOAWAY boundary must still fit in a QUIC variable integer.
                     let next = VarInt::try_from(u64::from(id) + 4).map_err(|_| {
-                        ErrorCode::IdError.reason("invalid stream or push identifier")
+                        ErrorCode::RequestRejected
+                            .stream("request cannot be admitted at the end of stream ID space")
                     })?;
                     *boundary = StreamId::from(next);
                 }
                 Ok(())
             }
-            Self::Gone(_) => Err(ErrorCode::RequestRejected.reason("request rejected")),
+            Self::Gone(boundary) => {
+                if id < *boundary {
+                    Ok(())
+                } else {
+                    Err(ErrorCode::RequestRejected.stream("request rejected"))
+                }
+            }
         }
     }
 }
@@ -62,6 +74,7 @@ impl StreamView {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn local_not_goaway(&self) -> Result<()> {
         self.local.not_goaway()
     }
@@ -119,18 +132,17 @@ mod tests {
         let wrong_direction = StreamId::new(Role::Server, Dir::Uni, 0);
         assert_eq!(
             view.accept(wrong_role).unwrap_err().code,
-            ErrorCode::IdError
+            ErrorCode::InternalError
         );
         assert_eq!(
             view.accept(wrong_direction).unwrap_err().code,
-            ErrorCode::IdError
+            ErrorCode::InternalError
         );
 
         let largest_server_bi = StreamId::from(VarInt::try_from((1_u64 << 62) - 3).unwrap());
-        assert_eq!(
-            view.accept(largest_server_bi).unwrap_err().code,
-            ErrorCode::IdError
-        );
+        let error = view.accept(largest_server_bi).unwrap_err();
+        assert_eq!(error.code, ErrorCode::RequestRejected);
+        assert!(matches!(error, crate::Error::Stream(_)));
 
         let local = view.goaway();
         assert_eq!(view.goaway(), local);

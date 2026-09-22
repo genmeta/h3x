@@ -15,7 +15,9 @@ use futures::task::AtomicWaker;
 use qbase::{ArcReceiving, sid::StreamId};
 use qrecovery::{recv::StopSending, send::CancelStream};
 
-use super::{ArcH3Stream, H3ReadStream, H3WriteStream, view::StreamView};
+use super::{
+    ArcH3Stream, H3ReadStream, H3WriteStream, StreamEvent, StreamEventHandler, view::StreamView,
+};
 use crate::{ArcQpack, Error, ErrorCode, Result, Role};
 
 /// Admission boundaries and registered streams share the connection's lock.
@@ -41,6 +43,17 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
             .clean_if(|| self.reads.is_empty() && self.writes.is_empty());
     }
 
+    fn remove_read(&mut self, id: u64) {
+        self.reads.remove(&id);
+        self.try_wake();
+    }
+
+    fn remove_write(&mut self, id: u64) {
+        self.writes.remove(&id);
+        self.try_wake();
+    }
+
+    #[cfg(test)]
     pub(crate) fn local_not_goway(&self) -> Result<()> {
         self.view.local_not_goaway()
     }
@@ -149,6 +162,10 @@ impl ArcDrain {
         self.0.lock().unwrap().clean_if(predicet);
     }
 
+    fn dirty(&self) {
+        self.0.lock().unwrap().dirty();
+    }
+
     fn goaway(&self) {
         self.0.lock().unwrap().goaway();
     }
@@ -166,6 +183,10 @@ impl Drain {
 
     fn goaway(&self) {
         self.gone.fetch_or(Self::GONE, Ordering::AcqRel);
+    }
+
+    fn dirty(&self) {
+        self.gone.fetch_and(!Self::CLEAN, Ordering::AcqRel);
     }
 
     fn clean_if(&self, predicet: impl Fn() -> bool) {
@@ -198,6 +219,70 @@ where
     R: StopSending + Send + 'static,
     W: CancelStream + Send + 'static,
 {
+    fn on_read_aborted(streams: &Mutex<BiStreams<R, W>>, qpack: &ArcQpack, id: u64, code: u64) {
+        let write = {
+            let mut guard = streams.lock().unwrap();
+            let write = guard.writes.get(&id).cloned();
+            guard.remove_read(id);
+            write
+        };
+        if code != ErrorCode::NoError.as_u64()
+            && write.is_some_and(|write| write.terminate(|io| io.cancel(code)))
+        {
+            streams.lock().unwrap().remove_write(id);
+        }
+        if let Err(error) = qpack.cancel_decode(id) {
+            qpack.on_connection_error(error);
+        }
+    }
+
+    fn on_write_aborted(streams: &Mutex<BiStreams<R, W>>, qpack: &ArcQpack, id: u64, code: u64) {
+        let read = {
+            let mut guard = streams.lock().unwrap();
+            let read = guard.reads.get(&id).cloned();
+            guard.remove_write(id);
+            read
+        };
+        if code != ErrorCode::NoError.as_u64()
+            && read.is_some_and(|read| read.terminate(|io| io.stop(code)))
+        {
+            streams.lock().unwrap().remove_read(id);
+        }
+        if code != ErrorCode::NoError.as_u64()
+            && let Err(error) = qpack.cancel_decode(id)
+        {
+            qpack.on_connection_error(error);
+        }
+    }
+
+    fn read_event_handler(&self, id: u64, qpack: ArcQpack) -> StreamEventHandler {
+        let streams = Arc::downgrade(&self.inner);
+        Arc::new(move |event| {
+            if let Some(streams) = streams.upgrade() {
+                match event {
+                    StreamEvent::Finished => streams.lock().unwrap().remove_read(id),
+                    StreamEvent::Aborted { code } => {
+                        Self::on_read_aborted(&streams, &qpack, id, code)
+                    }
+                }
+            }
+        })
+    }
+
+    fn write_event_handler(&self, id: u64, qpack: ArcQpack) -> StreamEventHandler {
+        let streams = Arc::downgrade(&self.inner);
+        Arc::new(move |event| {
+            if let Some(streams) = streams.upgrade() {
+                match event {
+                    StreamEvent::Finished => streams.lock().unwrap().remove_write(id),
+                    StreamEvent::Aborted { code } => {
+                        Self::on_write_aborted(&streams, &qpack, id, code)
+                    }
+                }
+            }
+        })
+    }
+
     // The caller holds the admission lock across checking and registration.
     pub(crate) fn insert(
         &self,
@@ -207,53 +292,14 @@ where
         send: W,
         qpack: ArcQpack,
     ) -> (H3ReadStream<R>, H3WriteStream<W>) {
-        let mut read = H3ReadStream::new(id, recv);
-        let mut write = H3WriteStream::new(id, send);
+        // A stream may be opened after local GOAWAY and before peer GOAWAY.
+        // Such a stream invalidates any CLEAN state recorded while the registry
+        // was temporarily empty.
+        guard.drain.dirty();
+        let read = H3ReadStream::new(id, recv, self.read_event_handler(id, qpack.clone()));
+        let write = H3WriteStream::new(id, send, self.write_event_handler(id, qpack));
         guard.reads.insert(id, read.state.clone());
         guard.writes.insert(id, write.state.clone());
-        write.on_finish({
-            let bistreams = self.inner.clone();
-            move || {
-                let mut guard = bistreams.lock().unwrap();
-                guard.writes.remove(&id);
-                guard.try_wake();
-            }
-        });
-        read.on_finish({
-            let bistreams = self.inner.clone();
-            move || {
-                let mut guard = bistreams.lock().unwrap();
-                guard.reads.remove(&id);
-                guard.try_wake();
-            }
-        });
-        read.on_cancel({
-            let finish = write.finish_cb.clone();
-            let write = write.state.clone();
-            let qpack = qpack.clone();
-            move |code| {
-                if code != ErrorCode::NoError.as_u64() && write.terminate(|io| io.cancel(code)) {
-                    finish();
-                }
-                if let Err(error) = qpack.cancel_decode(id) {
-                    qpack.on_connection_error(error);
-                }
-            }
-        });
-        write.on_cancel({
-            let finish = read.finish_cb.clone();
-            let read = read.state.clone();
-            move |code| {
-                if code != ErrorCode::NoError.as_u64() {
-                    if read.terminate(|io| io.stop(code)) {
-                        finish();
-                    }
-                    if let Err(error) = qpack.cancel_decode(id) {
-                        qpack.on_connection_error(error);
-                    }
-                }
-            }
-        });
         (read, write)
     }
 }

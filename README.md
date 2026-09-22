@@ -218,23 +218,24 @@ The sender still checks declared lengths while streaming.
 
 `h3x::Result<T>` returns `h3x::Error`, which contains a protocol `code` and a
 descriptive `reason`. Use `error.code` for protocol decisions and `error.reason`
-for diagnostics. `Error` contains only `code` and `reason`, and implements
-`std::error::Error` and `Display` with `thiserror`. Underlying error details are
-included in `reason`; there is no source chain. Streams retain raw I/O errors
-until a protocol boundary classifies them. Wrapping an `Error` in `io::Error`
-preserves the protocol code and reason.
+for diagnostics. Its `Stream` and `Connection` variants specify whether handling
+the error aborts one request or the entire HTTP/3 connection. Error construction
+requires this scope to be selected explicitly. Underlying error details are included
+in `reason`; there is no source chain. Streams retain raw I/O errors until a protocol
+boundary classifies them. Wrapping an `Error` in `io::Error` preserves its scope,
+protocol code, and reason.
 
 ```rust
 use h3x::{Error, ErrorCode};
 
-let error = Error::new(ErrorCode::H3_MESSAGE_ERROR, "missing pseudo-header :status");
-assert_eq!(error.code, ErrorCode::H3_MESSAGE_ERROR);
+let error = ErrorCode::MessageError.stream("missing pseudo-header :status");
+assert_eq!(error.code, ErrorCode::MessageError);
 assert_eq!(Error::from(std::io::Error::from(error.clone())), error);
 ```
 
 Transport adapters report connection failures through open/accept and stream I/O,
-retaining the supplied close reason. Construct failures with `Error::new(code, reason)` or
-`code.with_reason(reason)`, supplying the context at the point of failure.
+retaining the supplied close reason. Construct failures with `code.stream(reason)` or
+`code.connection(reason)`, supplying both the context and scope at the point of failure.
 
 ## Server-Initiated Requests
 

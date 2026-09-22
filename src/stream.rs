@@ -15,6 +15,14 @@ pub(crate) use write::H3WriteStream;
 
 use crate::ErrorCode;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamEvent {
+    Finished,
+    Aborted { code: u64 },
+}
+
+pub(crate) type StreamEventHandler = Arc<dyn Fn(StreamEvent) + Send + Sync>;
+
 /// A GOAWAY boundary rejected this request; other errors come from transport I/O.
 #[derive(Debug)]
 pub(crate) struct Goaway;
@@ -157,7 +165,7 @@ impl<T> ArcH3Stream<T> {
         match state.as_mut() {
             Ok(stream) => stream.poll_io(cx, f),
             Err(Goaway) => Poll::Ready(Err(ErrorCode::RequestRejected
-                .reason("request rejected by GOAWAY")
+                .stream("request rejected by GOAWAY")
                 .into())),
         }
     }
@@ -246,6 +254,8 @@ mod tests {
         else {
             panic!("GOAWAY must reject I/O")
         };
-        assert_eq!(crate::Error::from(error).code, ErrorCode::RequestRejected);
+        let error = crate::Error::from(error);
+        assert_eq!(error.code, ErrorCode::RequestRejected);
+        assert!(matches!(error, crate::Error::Stream(_)));
     }
 }

@@ -83,19 +83,17 @@ fn map_dquic_error(error: std::io::Error) -> Error {
                 StreamError::Connection(qbase::error::Error::App(error)) => {
                     ErrorCode::try_from(error.error_code())
                         .unwrap_or(ErrorCode::NoError)
-                        .reason(error.reason())
-                        .connection()
+                        .connection(error.reason())
                 }
-                StreamError::Connection(error) => ErrorCode::InternalError
-                    .reason(error.to_string())
-                    .connection(),
+                StreamError::Connection(error) => {
+                    ErrorCode::InternalError.connection(error.to_string())
+                }
                 StreamError::Reset(error) => ErrorCode::try_from(error.error_code())
                     .unwrap_or(ErrorCode::NoError)
-                    .reason("peer reset the stream")
-                    .stream(),
-                StreamError::EosSent => ErrorCode::InternalError
-                    .reason("stream is already finished")
-                    .stream(),
+                    .stream("peer reset the stream"),
+                StreamError::EosSent => {
+                    ErrorCode::InternalError.stream("stream is already finished")
+                }
             };
         }
         source = cause.source();
@@ -185,7 +183,7 @@ async fn accept_error_wakes_goaway_and_idle_critical_writers() {
     .await
     .unwrap();
     let goaway = connection.clone().goaway();
-    let expected = ErrorCode::InternalError.reason("accept observed connection failure");
+    let expected = ErrorCode::InternalError.connection("accept observed connection failure");
     failure.send_replace(Some(expected.clone()));
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(1), goaway)
@@ -231,10 +229,9 @@ async fn pool_returns_factory_error_and_retries_on_next_get() {
     });
 
     assert!(matches!(pool.get(&1).await, Err("factory failed")));
-    let connection = pool.get(&1).await.unwrap();
+    let _connection = pool.get(&1).await.unwrap();
     pool.get(&1).await.unwrap();
     assert_eq!(builds.load(Ordering::SeqCst), 2);
-    drop(connection);
 }
 
 #[tokio::test]
@@ -275,7 +272,7 @@ async fn pool_removal_allows_inflight_build_without_replacing_new_entry() {
         });
         started.notified().await;
         assert!(pool.remove(&1));
-        let replacement = pool.get(&1).await.unwrap();
+        let _replacement = pool.get(&1).await.unwrap();
         resume.notify_one();
         let old = old_get.await.unwrap().unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 2);
@@ -286,7 +283,6 @@ async fn pool_removal_allows_inflight_build_without_replacing_new_entry() {
         tokio::task::yield_now().await;
         pool.get(&1).await.unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 2);
-        drop(replacement);
     })
     .await
     .unwrap();
@@ -315,12 +311,12 @@ async fn pool_serializes_builds_and_replaces_goaway_connections() {
     });
     let (first, second) = tokio::join!(pool.get(&1), pool.get(&1));
     let first = first.unwrap();
-    let second = second.unwrap();
+    let _second = second.unwrap();
     assert_eq!(builds.load(Ordering::SeqCst), 1);
     drop(first.goaway());
     // Eviction is asynchronous: let the connection observer process GOAWAY.
     tokio::task::yield_now().await;
-    let replacement = pool.get(&1).await.unwrap();
+    let _replacement = pool.get(&1).await.unwrap();
     assert_eq!(builds.load(Ordering::SeqCst), 2);
     // An old observer must not evict the replacement generation.
     tokio::task::yield_now().await;
@@ -328,5 +324,4 @@ async fn pool_serializes_builds_and_replaces_goaway_connections() {
     assert_eq!(builds.load(Ordering::SeqCst), 2);
     assert!(pool.remove(&1));
     assert!(!pool.remove(&1));
-    drop((second, replacement));
 }

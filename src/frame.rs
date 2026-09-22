@@ -67,9 +67,9 @@ impl TryFrom<u64> for FrameType {
             0x07 => Ok(Self::Goaway),
             0x0d => Ok(Self::MaxPushId),
             0x02 | 0x06 | 0x08 | 0x09 => Err(ErrorCode::FrameUnexpected
-                .reason("HTTP/2-reserved frame type is forbidden in HTTP/3")),
+                .connection("HTTP/2-reserved frame type is forbidden in HTTP/3")),
             _ => VarInt::try_from(value).map(Self::Unknown).map_err(|error| {
-                ErrorCode::FrameError.reason(format!(
+                ErrorCode::FrameError.connection(format!(
                     "frame type exceeds the QUIC variable-integer range: {error}"
                 ))
             }),
@@ -87,7 +87,7 @@ pub(crate) struct Frame<P: GetFrameType + EncodeSize> {
 impl<P: GetFrameType + EncodeSize> Frame<P> {
     pub(crate) fn new(payload: P) -> Result<Self> {
         let length = VarInt::try_from(payload.encoding_size()).map_err(|error| {
-            ErrorCode::FrameError.reason(format!(
+            ErrorCode::FrameError.connection(format!(
                 "encoded frame length exceeds the QUIC variable-integer range: {error}"
             ))
         })?;
@@ -148,7 +148,7 @@ pub(crate) async fn be_frame_type<T: AsyncRead + Unpin + ?Sized>(
         return Ok(None);
     }
     let ty = be_varint(&mut first.as_slice().chain(reader)).await?;
-    ty.ok_or_else(|| ErrorCode::FrameError.reason("frame is missing a complete type"))?
+    ty.ok_or_else(|| ErrorCode::FrameError.connection("frame is missing a complete type"))?
         .into_u64()
         .try_into()
         .map(Some)
@@ -159,7 +159,7 @@ pub(crate) async fn be_frame_length<T: AsyncRead + Unpin + ?Sized>(
     reader: &mut T,
 ) -> io::Result<VarInt> {
     be_varint(reader).await?.ok_or_else(|| {
-        io::Error::other(ErrorCode::FrameError.reason("frame is missing a complete length"))
+        io::Error::other(ErrorCode::FrameError.connection("frame is missing a complete length"))
     })
 }
 
@@ -172,7 +172,7 @@ pub(crate) async fn skip_payload<T: AsyncRead + Unpin + ?Sized>(
     tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
     if payload.limit() != 0 {
         return Err(ErrorCode::FrameError
-            .reason("frame payload ended before its declared length")
+            .connection("frame payload ended before its declared length")
             .into());
     }
     Ok(())
@@ -191,7 +191,7 @@ pub(crate) async fn be_frame_payload<T: AsyncRead + Unpin + ?Sized>(
             payload: Data(usize::try_from(length.into_u64()).map_err(|error| {
                 io::Error::other(
                     ErrorCode::FrameError
-                        .reason(format!("DATA length does not fit in memory: {error}")),
+                        .connection(format!("DATA length does not fit in memory: {error}")),
                 )
             })?),
         }),
@@ -226,14 +226,14 @@ async fn read_payload<T: AsyncRead + Unpin + ?Sized>(
 ) -> io::Result<Bytes> {
     if length > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
         return Err(ErrorCode::ExcessiveLoad
-            .reason("configured resource limit exceeded")
+            .connection("configured resource limit exceeded")
             .into());
     }
     let mut payload = vec![0; length as usize];
     reader.read_exact(&mut payload).await.map_err(|error| {
         if error.kind() == io::ErrorKind::UnexpectedEof {
             io::Error::other(
-                ErrorCode::FrameError.reason("frame payload ended before its declared length"),
+                ErrorCode::FrameError.connection("frame payload ended before its declared length"),
             )
         } else {
             error
