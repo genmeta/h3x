@@ -1,4 +1,5 @@
 use std::{
+    future::{Future, poll_fn},
     io,
     pin::Pin,
     task::{Context, Poll},
@@ -7,7 +8,7 @@ use std::{
 use qrecovery::recv::StopSending;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
-use super::{ArcH3Stream, StreamEvent, StreamEventHandler};
+use super::{ArcH3Stream, Goaway, StreamEvent, StreamEventHandler};
 use crate::{
     ArcQpack, Error, ErrorCode, TransportError,
     common::{
@@ -105,6 +106,29 @@ pub(crate) enum NextFrame {
 }
 
 impl<R: AsyncRead + StopSending + TransportError + Unpin> H3ReadStream<R> {
+    async fn decode(
+        &self,
+        qpack: &ArcQpack,
+        payload: bytes::Bytes,
+    ) -> crate::Result<Vec<crate::qpack::Field>> {
+        let decoding = qpack.decode(self.stream_id(), payload);
+        tokio::pin!(decoding);
+
+        poll_fn(|cx| {
+            let state = self.state.0.lock().unwrap();
+            match state.as_ref() {
+                Ok(stream) if !stream.is_finished() => decoding.as_mut().poll(cx),
+                Ok(_) => Poll::Ready(Err(
+                    ErrorCode::RequestCancelled.stream("stream is terminated")
+                )),
+                Err(Goaway) => Poll::Ready(Err(
+                    ErrorCode::RequestRejected.stream("request rejected by GOAWAY")
+                )),
+            }
+        })
+        .await
+    }
+
     async fn read_frame(&mut self) -> crate::Result<Option<H3Frame>> {
         let Some(ty) = frame::be_frame_type(self).await.map_err(R::map_error)? else {
             return Ok(None);
@@ -189,9 +213,7 @@ where
             let frame = self.read_headers_frame().await?.ok_or_else(|| {
                 ErrorCode::RequestIncomplete.stream("stream ended before request HEADERS")
             })?;
-            let fields = qpack
-                .decode(self.stream_id(), frame.payload.field_section)
-                .await?;
+            let fields = self.decode(&qpack, frame.payload.field_section).await?;
             Request::from_fields(fields, consumer).map_err(Error::stream)
         }
         .await
@@ -223,9 +245,7 @@ where
                             }
                         }
                         NextFrame::Trailer(frame) => {
-                            let fields = qpack
-                                .decode(self.stream_id(), frame.payload.field_section)
-                                .await?;
+                            let fields = self.decode(&qpack, frame.payload.field_section).await?;
                             message_trailers
                                 .extend_fields(fields)
                                 .map_err(Error::stream)?;
@@ -271,9 +291,7 @@ where
                     ErrorCode::RequestIncomplete
                         .stream("stream ended before final response HEADERS")
                 })?;
-                let fields = qpack
-                    .decode(self.stream_id(), frame.payload.field_section)
-                    .await?;
+                let fields = self.decode(&qpack, frame.payload.field_section).await?;
                 let response =
                     Response::from_fields(fields, consumer.clone()).map_err(Error::stream)?;
                 if response.status().is_informational() {
@@ -323,9 +341,7 @@ where
                                 return Err(ErrorCode::MessageError
                                     .stream("trailers are not allowed for this response"));
                             }
-                            let fields = qpack
-                                .decode(self.stream_id(), frame.payload.field_section)
-                                .await?;
+                            let fields = self.decode(&qpack, frame.payload.field_section).await?;
                             message_trailers
                                 .extend_fields(fields)
                                 .map_err(Error::stream)?;
@@ -358,7 +374,7 @@ mod tests {
     use std::{
         pin::Pin,
         sync::{
-            Arc, Mutex,
+            Arc, Barrier, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll},
@@ -448,6 +464,56 @@ mod tests {
 
     fn events() -> StreamEventHandler {
         Arc::new(|_| {})
+    }
+
+    #[test]
+    fn stop_before_decode_registration_prevents_a_new_qpack_wait() {
+        let qpack = crate::qpack::tests::qpack();
+        qpack
+            .with_state(|state| {
+                state.decoder.on_instruction(|_| Ok(()));
+                Ok(())
+            })
+            .unwrap();
+
+        let event_qpack = qpack.clone();
+        let stream = Arc::new(H3ReadStream::new(
+            4,
+            Io::default(),
+            Arc::new(move |event| {
+                if matches!(event, StreamEvent::Aborted { .. }) {
+                    event_qpack.cancel_decode(4).unwrap();
+                }
+            }),
+        ));
+        let headers_read = Arc::new(Barrier::new(2));
+        let resume_decode = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let receiving = stream.clone();
+            let receiving_qpack = qpack.clone();
+            let receiving_headers_read = headers_read.clone();
+            let receiving_resume_decode = resume_decode.clone();
+            let receive = scope.spawn(move || {
+                // RIC=1, Base=0, post-Base index 0: this would wait for an insert.
+                let payload = Bytes::from_static(&[0x02, 0x80, 0x10]);
+                let mut decoding = Box::pin(receiving.decode(&receiving_qpack, payload));
+                receiving_headers_read.wait();
+                receiving_resume_decode.wait();
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                decoding.as_mut().poll(&mut cx)
+            });
+
+            headers_read.wait();
+            let mut application = &*stream;
+            application.stop(ErrorCode::RequestCancelled.as_u64());
+            resume_decode.wait();
+
+            let Poll::Ready(Err(error)) = receive.join().unwrap() else {
+                panic!("a stopped stream must not start another QPACK wait")
+            };
+            assert_eq!(error.code, ErrorCode::RequestCancelled);
+        });
     }
 
     fn headers(bytes: &'static [u8]) -> Vec<u8> {

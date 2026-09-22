@@ -105,11 +105,16 @@ impl<T: Transport> H3Connection<T> {
         // Pending releases the lock; Ready registers the stream before GOAWAY can run.
         poll_fn(|cx| {
             let mut guard = self.bi_streams.lock().unwrap();
-            let (id, (recv, send)) = ready!(opening.as_mut().poll(cx))?.ok_or_else(|| {
-                ErrorCode::StreamCreationError
-                    .connection("transport cannot open a bidirectional stream")
-            })?;
-            guard.remote_no_goway()?;
+            let (id, (mut recv, mut send)) =
+                ready!(opening.as_mut().poll(cx))?.ok_or_else(|| {
+                    ErrorCode::StreamCreationError
+                        .connection("transport cannot open a bidirectional stream")
+                })?;
+            if let Err(error) = guard.remote_no_goway() {
+                recv.stop(ErrorCode::RequestRejected.as_u64());
+                send.cancel(ErrorCode::RequestRejected.as_u64());
+                return Poll::Ready(Err(error));
+            }
             let (read, write) =
                 self.bi_streams
                     .insert(&mut guard, id, recv, send, self.qpack.clone());
@@ -320,19 +325,35 @@ mod tests {
     struct Io {
         bytes: VecDeque<u8>,
         writes_before_failure: Option<usize>,
+        stop_codes: Option<Arc<Mutex<Vec<u64>>>>,
+        cancel_codes: Option<Arc<Mutex<Vec<u64>>>>,
     }
 
     impl Io {
         fn from(bytes: &[u8]) -> Self {
             Self {
                 bytes: bytes.iter().copied().collect(),
-                writes_before_failure: None,
+                ..Self::default()
             }
         }
 
         fn fail_after_writes(writes: usize) -> Self {
             Self {
                 writes_before_failure: Some(writes),
+                ..Self::default()
+            }
+        }
+
+        fn recording_stops(codes: Arc<Mutex<Vec<u64>>>) -> Self {
+            Self {
+                stop_codes: Some(codes),
+                ..Self::default()
+            }
+        }
+
+        fn recording_cancels(codes: Arc<Mutex<Vec<u64>>>) -> Self {
+            Self {
+                cancel_codes: Some(codes),
                 ..Self::default()
             }
         }
@@ -380,11 +401,19 @@ mod tests {
     }
 
     impl StopSending for Io {
-        fn stop(&mut self, _: u64) {}
+        fn stop(&mut self, code: u64) {
+            if let Some(codes) = &self.stop_codes {
+                codes.lock().unwrap().push(code);
+            }
+        }
     }
 
     impl CancelStream for Io {
-        fn cancel(&mut self, _: u64) {}
+        fn cancel(&mut self, code: u64) {
+            if let Some(codes) = &self.cancel_codes {
+                codes.lock().unwrap().push(code);
+            }
+        }
     }
 
     impl crate::TransportError for Io {
@@ -400,6 +429,7 @@ mod tests {
         accept: Mutex<Option<Result<BiStream>>>,
         closes: AtomicUsize,
         uni_writes_before_failure: Option<usize>,
+        open_ready: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl TestTransport {
@@ -409,11 +439,17 @@ mod tests {
                 accept: Mutex::new(Some(accept)),
                 closes: AtomicUsize::new(0),
                 uni_writes_before_failure: None,
+                open_ready: None,
             }
         }
 
         fn failing_goaway(mut self) -> Self {
             self.uni_writes_before_failure = Some(1);
+            self
+        }
+
+        fn wait_to_open(mut self, ready: Arc<tokio::sync::Notify>) -> Self {
+            self.open_ready = Some(ready);
             self
         }
     }
@@ -426,6 +462,9 @@ mod tests {
             crate::Role::Client
         }
         async fn open_bi(&self) -> Result<Option<(u64, (Io, Io))>> {
+            if let Some(ready) = &self.open_ready {
+                ready.notified().await;
+            }
             Ok(self.open.lock().unwrap().take().unwrap())
         }
         async fn accept_bi(&self) -> Result<(u64, (Io, Io))> {
@@ -488,6 +527,59 @@ mod tests {
             Ok((1, (Io::default(), Io::default()))),
         ));
         assert!(accepted.accept_bi().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn open_bi_rejects_both_halves_if_peer_goaway_arrives_while_pending() {
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let stop_codes = Arc::new(Mutex::new(Vec::new()));
+        let cancel_codes = Arc::new(Mutex::new(Vec::new()));
+        let connection = connection(
+            TestTransport::new(
+                Some((
+                    0,
+                    (
+                        Io::recording_stops(stop_codes.clone()),
+                        Io::recording_cancels(cancel_codes.clone()),
+                    ),
+                )),
+                Err(ErrorCode::InternalError.connection("unused")),
+            )
+            .wait_to_open(ready.clone()),
+        );
+        let mut opening = Box::pin(connection.open_bi());
+
+        poll_fn(|cx| {
+            assert!(opening.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        connection
+            .bi_streams
+            .lock()
+            .unwrap()
+            .on_goaway(
+                qbase::sid::StreamId::new(crate::Role::Client, qbase::sid::Dir::Bi, 0),
+                connection.qpack.clone(),
+            )
+            .unwrap();
+
+        ready.notify_one();
+        let error = match opening.await {
+            Ok(_) => panic!("peer GOAWAY must reject a stream returned after admission closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, ErrorCode::RequestRejected);
+        assert!(matches!(error, Error::Stream(_)));
+        assert_eq!(
+            *stop_codes.lock().unwrap(),
+            [ErrorCode::RequestRejected.as_u64()]
+        );
+        assert_eq!(
+            *cancel_codes.lock().unwrap(),
+            [ErrorCode::RequestRejected.as_u64()]
+        );
     }
 
     #[tokio::test]

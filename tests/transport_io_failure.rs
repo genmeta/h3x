@@ -91,9 +91,7 @@ fn map_dquic_error(error: std::io::Error) -> Error {
                 StreamError::Reset(error) => ErrorCode::try_from(error.error_code())
                     .unwrap_or(ErrorCode::NoError)
                     .stream("peer reset the stream"),
-                StreamError::EosSent => {
-                    ErrorCode::InternalError.stream("stream is already finished")
-                }
+                StreamError::Finished => todo!(),
             };
         }
         source = cause.source();

@@ -1,0 +1,11 @@
+[package]
+name = "wasi-http-read-request-then-respond"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasip2.workspace = true
