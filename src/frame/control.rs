@@ -95,26 +95,32 @@ pub(crate) async fn be_control<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Con
     let ty = frame::be_varint(recv)
         .await
         .map_err(|error| crate::Error::from_io(error, ErrorCode::ClosedCriticalStream))?
-        .ok_or_else(|| ErrorCode::ClosedCriticalStream.reason("critical HTTP/3 stream closed"))?;
+        .ok_or_else(|| {
+            ErrorCode::ClosedCriticalStream.connection("critical HTTP/3 stream closed")
+        })?;
     let known = match ty.into_u64() {
         4 => Some(FrameType::Settings),
         3 => Some(FrameType::CancelPush),
         7 => Some(FrameType::Goaway),
         13 => Some(FrameType::MaxPushId),
         0..=9 => {
-            return Err(ErrorCode::FrameUnexpected.reason("frame is not allowed in this context"));
+            return Err(
+                ErrorCode::FrameUnexpected.connection("frame is not allowed in this context")
+            );
         }
         _ => None,
     };
     let length = frame::be_varint(recv)
         .await
         .map_err(|error| crate::Error::from_io(error, ErrorCode::ClosedCriticalStream))?
-        .ok_or_else(|| ErrorCode::ClosedCriticalStream.reason("critical HTTP/3 stream closed"))?;
+        .ok_or_else(|| {
+            ErrorCode::ClosedCriticalStream.connection("critical HTTP/3 stream closed")
+        })?;
     let Some(known) = known else {
         return Ok(Control::Unknown { ty, length });
     };
     if length.into_u64() > frame::MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(ErrorCode::ExcessiveLoad.reason("configured resource limit exceeded"));
+        return Err(ErrorCode::ExcessiveLoad.connection("configured resource limit exceeded"));
     }
     let mut payload = vec![0; length.into_u64() as usize];
     recv.read_exact(&mut payload)

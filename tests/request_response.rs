@@ -1,11 +1,12 @@
 mod support;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use h3x::{
     R, ReadRequest, ReadResponse, Request, Response, W, WndBuf, WriteRequest, WriteResponse,
 };
 use http::{Method, StatusCode, header};
+use qrecovery::recv::StopSending;
 use support::connection_pair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -52,6 +53,132 @@ async fn content_length_request_and_response() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(collect(response.into_body()).await, "world");
+    serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn completed_request_write_keeps_response_read_open() {
+    let (client, server) = connection_pair();
+    let (request_received_tx, request_received_rx) = tokio::sync::oneshot::channel();
+    let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+
+    let serving = tokio::spawn(async move {
+        let (ws, rs) = server.accept_bi().await.unwrap();
+        let request: Request<R> = rs.read_request(server.qpack().clone()).await.unwrap();
+        assert_eq!(collect(request.into_body()).await, "request complete");
+        request_received_tx.send(()).unwrap();
+
+        respond_rx.await.unwrap();
+        let response: Response<W> = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(finished_body(b"response complete").await)
+            .unwrap()
+            .into();
+        ws.write_response(response, Method::POST, server.qpack().clone())
+            .await
+            .unwrap();
+    });
+
+    let (ws, rs) = client.open_bi().await.unwrap();
+    let request: Request<W> = http::Request::builder()
+        .method(Method::POST)
+        .uri("https://example.com/half-close")
+        .body(finished_body(b"request complete").await)
+        .unwrap()
+        .into();
+
+    ws.write_request(request, client.qpack().clone())
+        .await
+        .unwrap();
+    request_received_rx.await.unwrap();
+
+    let mut receiving = Box::pin(rs.read_response(Method::POST, client.qpack().clone()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut receiving)
+            .await
+            .is_err()
+    );
+
+    respond_tx.send(()).unwrap();
+    let response = receiving.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(collect(response.into_body()).await, "response complete");
+    serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn no_error_stop_interrupts_backpressured_request_upload_and_preserves_response() {
+    let (client, server) = connection_pair();
+    let (request_received_tx, request_received_rx) = tokio::sync::oneshot::channel();
+    let (stop_upload_tx, stop_upload_rx) = tokio::sync::oneshot::channel();
+
+    let serving = tokio::spawn(async move {
+        let (ws, rs) = server.accept_bi().await.unwrap();
+        let mut request: Request<R> = rs.read_request(server.qpack().clone()).await.unwrap();
+        request_received_tx.send(()).unwrap();
+        stop_upload_rx.await.unwrap();
+
+        request.stop(h3x::ErrorCode::NoError.as_u64());
+        let response: Response<W> = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(finished_body(b"early response").await)
+            .unwrap()
+            .into();
+        ws.write_response(response, Method::POST, server.qpack().clone())
+            .await
+            .unwrap();
+    });
+
+    let (ws, rs) = client.open_bi().await.unwrap();
+    let request_window = WndBuf::new(1);
+    let mut request_body = request_window.clone();
+    let request: Request<W> = http::Request::builder()
+        .method(Method::POST)
+        .uri("https://example.com/early-response")
+        .body(request_window)
+        .unwrap()
+        .into();
+    let mut uploading = tokio::spawn(ws.write_request(request, client.qpack().clone()));
+    let mut producing = tokio::spawn(async move {
+        request_body.write_all(&vec![b'x'; 128 * 1024]).await?;
+        request_body.shutdown().await
+    });
+
+    request_received_rx.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut producing)
+            .await
+            .is_err(),
+        "request producer should be backpressured while the server leaves the body unread"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut uploading)
+            .await
+            .is_err(),
+        "request upload should still be active before STOP_SENDING"
+    );
+
+    stop_upload_tx.send(()).unwrap();
+    let upload_error = tokio::time::timeout(Duration::from_secs(1), uploading)
+        .await
+        .expect("STOP_SENDING must unblock the request upload")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(upload_error, h3x::Error::Stream(_)));
+    let upload_code = upload_error.code;
+    let producer_error = tokio::time::timeout(Duration::from_secs(1), producing)
+        .await
+        .expect("request-body producer must observe upload cancellation")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(h3x::Error::from(producer_error).code, upload_code);
+
+    let response = rs
+        .read_response(Method::POST, client.qpack().clone())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(collect(response.into_body()).await, "early response");
     serving.await.unwrap();
 }
 

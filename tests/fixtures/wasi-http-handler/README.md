@@ -1,9 +1,19 @@
-# WASI HTTP handler fixture
+# WASI HTTP handler fixtures
 
-`src/lib.rs` implements the `wasi:http/incoming-handler` exercised by
-`tests/wasmtime_wasi_http.rs`. The generated component is committed as
-`../wasi-http-handler.wasm`, so normal builds and CI do not need a WebAssembly
-target or component tooling.
+Each directory under `handlers/` implements one `wasi:http/incoming-handler`
+behavior. The test server loads all three components and uses Axum to route
+`POST` requests by path:
+
+- `/read-request-then-respond` consumes the complete request before committing
+  the response.
+- `/respond-then-read-request` commits the response headers, consumes the
+  complete request, and only then writes the response body.
+- `/stream-response-until-cancelled` writes a response until the host cancels
+  its body.
+
+Each handler is built into its own component in the parent directory. The
+generated components are committed so normal builds and CI do not need a
+WebAssembly target or component tooling.
 
 After changing the handler, install `wasm-tools` and run:
 

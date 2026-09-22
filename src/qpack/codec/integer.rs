@@ -25,7 +25,7 @@ pub(super) async fn be_prefixed_integer_with_first<T: AsyncRead + Unpin + ?Sized
     if first & mask == mask {
         loop {
             if len == wire.len() {
-                return Err(error.reason("prefixed integer has too many continuation bytes"));
+                return Err(error.connection("prefixed integer has too many continuation bytes"));
             }
             let byte = be_byte(reader).await?;
             wire[len] = byte;
@@ -37,13 +37,13 @@ pub(super) async fn be_prefixed_integer_with_first<T: AsyncRead + Unpin + ?Sized
     }
     be_prefixed_integer(&wire[..len], bits)
         .map(|(_, value)| value)
-        .map_err(|cause| error.reason(format!("invalid instruction integer: {cause}")))
+        .map_err(|cause| error.connection(format!("invalid instruction integer: {cause}")))
 }
 
 /// RFC 9204 section 4.1.1: decode a prefixed integer, limited to 62 bits.
 pub(super) fn be_prefixed_integer(mut input: &[u8], prefix_bits: u8) -> Result<(&[u8], u64)> {
     let (&first, rest) = input.split_first().ok_or_else(|| {
-        ErrorCode::QpackDecompressionFailed.reason("prefixed integer is missing its first byte")
+        ErrorCode::QpackDecompressionFailed.connection("prefixed integer is missing its first byte")
     })?;
     input = rest;
     let limit = (1u64 << prefix_bits) - 1;
@@ -53,7 +53,7 @@ pub(super) fn be_prefixed_integer(mut input: &[u8], prefix_bits: u8) -> Result<(
     }
     for shift in (0..63).step_by(7) {
         let (&byte, rest) = input.split_first().ok_or_else(|| {
-            ErrorCode::QpackDecompressionFailed.reason("prefixed integer is truncated")
+            ErrorCode::QpackDecompressionFailed.connection("prefixed integer is truncated")
         })?;
         input = rest;
         value = value
@@ -61,14 +61,14 @@ pub(super) fn be_prefixed_integer(mut input: &[u8], prefix_bits: u8) -> Result<(
             .filter(|&value| value <= VARINT_MAX)
             .ok_or_else(|| {
                 ErrorCode::QpackDecompressionFailed
-                    .reason("prefixed integer exceeds the QUIC variable-integer range")
+                    .stream("prefixed integer exceeds the implementation limit")
             })?;
         if byte & 0x80 == 0 {
             return Ok((input, value));
         }
     }
     Err(ErrorCode::QpackDecompressionFailed
-        .reason("prefixed integer has too many continuation bytes"))
+        .stream("prefixed integer exceeds the implementation limit"))
 }
 
 /// Append a QPACK prefixed integer (not a QUIC varint).
@@ -85,7 +85,7 @@ impl<B: BufMut> WritePrefixedInteger for B {
     ) -> Result<()> {
         if value > VARINT_MAX {
             return Err(ErrorCode::QpackDecompressionFailed
-                .reason("invalid prefixed-integer width, value, or high bits"));
+                .connection("invalid prefixed-integer width, value, or high bits"));
         }
         let limit = (1u64 << prefix_bits) - 1;
         if value < limit {
@@ -135,14 +135,13 @@ mod tests {
 
     #[test]
     fn prefixed_integer_rejects_truncation_overflow_and_out_of_range_values() {
-        assert_eq!(
-            be_prefixed_integer(&[0x1f], 5).unwrap_err().code,
-            ErrorCode::QpackDecompressionFailed
-        );
-        assert_eq!(
-            be_prefixed_integer(&[0xff; 10], 8).unwrap_err().code,
-            ErrorCode::QpackDecompressionFailed
-        );
+        let truncated = be_prefixed_integer(&[0x1f], 5).unwrap_err();
+        assert_eq!(truncated.code, ErrorCode::QpackDecompressionFailed);
+        assert!(matches!(truncated, crate::Error::Connection(_)));
+
+        let oversized = be_prefixed_integer(&[0xff; 10], 8).unwrap_err();
+        assert_eq!(oversized.code, ErrorCode::QpackDecompressionFailed);
+        assert!(matches!(oversized, crate::Error::Stream(_)));
 
         let mut wire = Vec::new();
         assert_eq!(

@@ -34,7 +34,7 @@ pub(crate) async fn be_setting_frame<T: AsyncRead + Unpin + ?Sized>(
 ) -> std::io::Result<Frame<Settings>> {
     if length.into_u64() > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
         return Err(ErrorCode::ExcessiveLoad
-            .reason("configured resource limit exceeded")
+            .connection("configured resource limit exceeded")
             .into());
     }
     let mut payload = reader.take(length.into_u64());
@@ -42,15 +42,17 @@ pub(crate) async fn be_setting_frame<T: AsyncRead + Unpin + ?Sized>(
     while payload.limit() != 0 {
         let id = be_varint(&mut payload).await?.ok_or_else(|| {
             std::io::Error::other(
-                ErrorCode::FrameError.reason("SETTINGS payload is missing an identifier"),
+                ErrorCode::FrameError.connection("SETTINGS payload is missing an identifier"),
             )
         })?;
         let value = be_varint(&mut payload).await?.ok_or_else(|| {
-            std::io::Error::other(ErrorCode::FrameError.reason("SETTINGS identifier has no value"))
+            std::io::Error::other(
+                ErrorCode::FrameError.connection("SETTINGS identifier has no value"),
+            )
         })?;
         if matches!(id.into_u64(), 0x02..=0x05) || (id.into_u64() == 0x08 && value.into_u64() > 1) {
             return Err(ErrorCode::SettingsError
-                .reason("reserved SETTINGS identifier or invalid ENABLE_CONNECT_PROTOCOL value")
+                .connection("reserved SETTINGS identifier or invalid ENABLE_CONNECT_PROTOCOL value")
                 .into());
         }
         match values.entry(id) {
@@ -59,7 +61,7 @@ pub(crate) async fn be_setting_frame<T: AsyncRead + Unpin + ?Sized>(
             }
             Entry::Occupied(_) => {
                 return Err(ErrorCode::SettingsError
-                    .reason("duplicate SETTINGS identifier")
+                    .connection("duplicate SETTINGS identifier")
                     .into());
             }
         }

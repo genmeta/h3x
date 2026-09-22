@@ -1,7 +1,6 @@
 use std::{
-    io,
+    io, mem,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -9,9 +8,9 @@ use bytes::Bytes;
 use qrecovery::send::CancelStream;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::ArcH3Stream;
+use super::{ArcH3Stream, H3Stream, StreamEventHandler};
 use crate::{
-    ArcQpack, Error, TransportError,
+    ArcQpack, Error, ErrorCode, TransportError,
     common::{
         request::{Request, WriteRequest},
         response::{Response, WriteResponse},
@@ -23,27 +22,44 @@ use crate::{
 /// Application-owned write direction, sharing state with the connection registry.
 pub struct H3WriteStream<W: CancelStream> {
     pub(super) state: ArcH3Stream<W>,
-    pub(super) finish_cb: Arc<dyn Fn() + Send + Sync>,
-    cancel_cb: Arc<dyn Fn(u64) + Send + Sync>,
+    events: StreamEventHandler,
     id: u64,
 }
 
 impl<W: CancelStream> H3WriteStream<W> {
-    pub fn new(stream_id: u64, stream: W) -> Self {
+    pub(crate) fn new(stream_id: u64, stream: W, events: StreamEventHandler) -> Self {
         Self {
             state: ArcH3Stream::new(stream),
             id: stream_id,
-            finish_cb: Arc::new(|| {}),
-            cancel_cb: Arc::new(|_| {}),
+            events,
         }
     }
 
-    pub(super) fn on_finish(&mut self, callback: impl Fn() + Send + Sync + 'static) {
-        self.finish_cb = Arc::new(callback);
+    fn finish(&self) {
+        if self.state.finish() {
+            (self.events)(Ok(()));
+        }
     }
 
-    pub(super) fn on_cancel(&mut self, callback: impl Fn(u64) + Send + Sync + 'static) {
-        self.cancel_cb = Arc::new(callback);
+    fn fail(&self, error: Error) {
+        let code = error.code.as_u64();
+        if self.state.fail(error.clone(), |io| io.cancel(code)) {
+            (self.events)(Err(error));
+        }
+    }
+
+    fn error_handler(&self) -> impl FnOnce(Error) + Send + 'static
+    where
+        W: Send + 'static,
+    {
+        let state = self.state.clone();
+        let events = self.events.clone();
+        move |error| {
+            let code = error.code.as_u64();
+            if state.fail(error.clone(), |io| io.cancel(code)) {
+                events(Err(error));
+            }
+        }
     }
 
     pub fn stream_id(&self) -> u64 {
@@ -53,10 +69,10 @@ impl<W: CancelStream> H3WriteStream<W> {
 
 impl<W: CancelStream> CancelStream for &H3WriteStream<W> {
     fn cancel(&mut self, error_code: u64) {
-        if self.state.terminate(|io| io.cancel(error_code)) {
-            (self.finish_cb)();
-            (self.cancel_cb)(error_code);
-        }
+        let error = ErrorCode::try_from(error_code)
+            .unwrap_or(ErrorCode::InternalError)
+            .stream(format!("write stream cancelled with code 0x{error_code:x}"));
+        self.fail(error);
     }
 }
 
@@ -66,49 +82,138 @@ impl<W: CancelStream> CancelStream for H3WriteStream<W> {
     }
 }
 
-impl<W: AsyncWrite + CancelStream + Unpin> H3WriteStream<W> {
-    fn poll_io<O>(
-        &mut self,
-        cx: &mut Context<'_>,
-        finish: bool,
-        poll: impl FnOnce(Pin<&mut W>, &mut Context<'_>) -> Poll<io::Result<O>>,
-    ) -> Poll<io::Result<O>> {
-        let result = self.state.poll_io(cx, poll);
-        let completed = finish && matches!(result, Poll::Ready(Ok(_)));
-        let failed = matches!(&result, Poll::Ready(Err(error)) if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock));
-        if (completed || failed) && self.state.finish() {
-            (self.finish_cb)();
-        }
-        result
-    }
-}
-
-impl<W: AsyncWrite + CancelStream + Unpin> AsyncWrite for H3WriteStream<W> {
+impl<W: AsyncWrite + CancelStream + TransportError + Unpin> AsyncWrite for H3WriteStream<W> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut()
-            .poll_io(cx, false, |send, cx| send.poll_write(cx, buf))
+        let mut state = self.state.0.lock().unwrap();
+        let stream = match state.as_mut() {
+            Err(error) => return Poll::Ready(Err(error.clone().into())),
+            Ok(H3Stream::Finished) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            Ok(stream) => stream,
+        };
+        let mut io = match mem::replace(stream, H3Stream::Transition) {
+            H3Stream::Idle(io) | H3Stream::Polling(io, _) => io,
+            H3Stream::Finished | H3Stream::Transition => unreachable!(),
+        };
+        match Pin::new(&mut io).poll_write(cx, buf) {
+            Poll::Pending => {
+                *stream = H3Stream::Polling(io, cx.waker().clone());
+                Poll::Pending
+            }
+            Poll::Ready(Ok(value)) => {
+                *stream = H3Stream::Idle(io);
+                Poll::Ready(Ok(value))
+            }
+            Poll::Ready(Err(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                *stream = H3Stream::Idle(io);
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Err(error)) => {
+                let error = W::map_error(error);
+                *state = Err(error.clone());
+                drop(io);
+                drop(state);
+                (self.events)(Err(error.clone()));
+                Poll::Ready(Err(error.into()))
+            }
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut()
-            .poll_io(cx, false, |send, cx| send.poll_flush(cx))
+        let mut state = self.state.0.lock().unwrap();
+        let stream = match state.as_mut() {
+            Err(error) => return Poll::Ready(Err(error.clone().into())),
+            Ok(H3Stream::Finished) => return Poll::Ready(Ok(())),
+            Ok(stream) => stream,
+        };
+        let mut io = match mem::replace(stream, H3Stream::Transition) {
+            H3Stream::Idle(io) | H3Stream::Polling(io, _) => io,
+            H3Stream::Finished | H3Stream::Transition => unreachable!(),
+        };
+        match Pin::new(&mut io).poll_flush(cx) {
+            Poll::Pending => {
+                *stream = H3Stream::Polling(io, cx.waker().clone());
+                Poll::Pending
+            }
+            Poll::Ready(Ok(value)) => {
+                *stream = H3Stream::Idle(io);
+                Poll::Ready(Ok(value))
+            }
+            Poll::Ready(Err(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                *stream = H3Stream::Idle(io);
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Err(error)) => {
+                let error = W::map_error(error);
+                *state = Err(error.clone());
+                drop(io);
+                drop(state);
+                (self.events)(Err(error.clone()));
+                Poll::Ready(Err(error.into()))
+            }
+        }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut()
-            .poll_io(cx, true, |send, cx| send.poll_shutdown(cx))
+        let mut state = self.state.0.lock().unwrap();
+        let stream = match state.as_mut() {
+            Err(error) => return Poll::Ready(Err(error.clone().into())),
+            Ok(H3Stream::Finished) => return Poll::Ready(Ok(())),
+            Ok(stream) => stream,
+        };
+        let mut io = match mem::replace(stream, H3Stream::Transition) {
+            H3Stream::Idle(io) | H3Stream::Polling(io, _) => io,
+            H3Stream::Finished | H3Stream::Transition => unreachable!(),
+        };
+        match Pin::new(&mut io).poll_shutdown(cx) {
+            Poll::Pending => {
+                *stream = H3Stream::Polling(io, cx.waker().clone());
+                Poll::Pending
+            }
+            Poll::Ready(Ok(value)) => {
+                *stream = H3Stream::Finished;
+                drop(io);
+                drop(state);
+                (self.events)(Ok(()));
+                Poll::Ready(Ok(value))
+            }
+            Poll::Ready(Err(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                *stream = H3Stream::Idle(io);
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Err(error)) => {
+                let error = W::map_error(error);
+                *state = Err(error.clone());
+                drop(io);
+                drop(state);
+                (self.events)(Err(error.clone()));
+                Poll::Ready(Err(error.into()))
+            }
+        }
     }
 }
 
 impl<W: CancelStream> Drop for H3WriteStream<W> {
     fn drop(&mut self) {
-        if self.state.finish() {
-            (self.finish_cb)();
-        }
+        self.finish();
     }
 }
 
@@ -138,17 +243,7 @@ where
         }));
         let trailers = request.trailers.clone();
         let mut body = request.body;
-        body.on_error({
-            let state = self.state.clone();
-            let finish = self.finish_cb.clone();
-            let cancel = self.cancel_cb.clone();
-            move |error| {
-                if state.terminate(|io| io.cancel(error.code.as_u64())) {
-                    finish();
-                    cancel(error.code.as_u64());
-                }
-            }
-        });
+        body.on_error(self.error_handler());
         let producer = body.clone();
         let result: crate::Result<()> = async {
             let field_section = qpack.encode(self.stream_id(), fields)?;
@@ -191,7 +286,7 @@ where
             } else {
                 failure.stream()
             };
-            self.cancel(failure.code.as_u64());
+            self.fail(failure.clone());
             producer.error(failure.clone());
             qpack.error().unwrap_or(failure)
         })
@@ -228,17 +323,7 @@ where
         }));
         let trailers = response.trailers.clone();
         let mut body = response.body;
-        body.on_error({
-            let state = self.state.clone();
-            let finish = self.finish_cb.clone();
-            let cancel = self.cancel_cb.clone();
-            move |error| {
-                if state.terminate(|io| io.cancel(error.code.as_u64())) {
-                    finish();
-                    cancel(error.code.as_u64());
-                }
-            }
-        });
+        body.on_error(self.error_handler());
         let producer = body.clone();
         async {
             if !send_body {
@@ -291,7 +376,7 @@ where
             } else {
                 failure.stream()
             };
-            self.cancel(failure.code.as_u64());
+            self.fail(failure.clone());
             producer.error(failure.clone());
             qpack.error().unwrap_or(failure)
         })
@@ -353,6 +438,69 @@ mod tests {
         }
     }
 
+    fn events() -> StreamEventHandler {
+        Arc::new(|_| {})
+    }
+
+    struct FailingIo(Error);
+
+    impl AsyncWrite for FailingIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(self.0.clone().into()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(self.0.clone().into()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(self.0.clone().into()))
+        }
+    }
+
+    impl CancelStream for FailingIo {
+        fn cancel(&mut self, _: u64) {}
+    }
+
+    impl TransportError for FailingIo {
+        fn map_error(error: io::Error) -> Error {
+            Error::from_stream_io(error)
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_write_errors_report_their_scope() {
+        for error in [
+            ErrorCode::RequestCancelled.stream("stream stopped"),
+            ErrorCode::InternalError.connection("connection failed"),
+        ] {
+            for operation in 0..3 {
+                let reported = Arc::new(Mutex::new(Vec::new()));
+                let captured = reported.clone();
+                let mut stream = H3WriteStream::new(4, FailingIo(error.clone()), events());
+                let shared = stream.state.clone();
+                stream.events = Arc::new(move |event| {
+                    assert!(shared.0.try_lock().is_ok(), "notify outside the state lock");
+                    captured.lock().unwrap().push(event);
+                });
+                for _ in 0..2 {
+                    let result = match operation {
+                        0 => stream.write_all(b"x").await,
+                        1 => stream.flush().await,
+                        _ => stream.shutdown().await,
+                    };
+                    assert_eq!(Error::from_stream_io(result.unwrap_err()), error);
+                }
+                drop(stream);
+                assert_eq!(reported.lock().unwrap().as_slice(), [Err(error.clone())]);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn write_shutdown_notifies_finish_once() {
         let io = Io::default();
@@ -361,15 +509,26 @@ mod tests {
         let shutdowns = io.shutdowns.clone();
         let completed = Arc::new(AtomicUsize::new(0));
         let count = completed.clone();
-        let mut stream = H3WriteStream::new(4, io);
-        stream.on_finish(move || {
-            count.fetch_add(1, Ordering::SeqCst);
-        });
+        let mut stream = H3WriteStream::new(
+            4,
+            io,
+            Arc::new(move |event| {
+                if event.is_ok() {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
         let _registered = stream.state.clone();
         assert_eq!(stream.stream_id(), 4);
         stream.write_all(b"hello").await.unwrap();
         stream.flush().await.unwrap();
         AsyncWriteExt::shutdown(&mut stream).await.unwrap();
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+        assert_eq!(
+            stream.write(b"x").await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
         assert_eq!(&*bytes.lock().unwrap(), b"hello");
         assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
         assert_eq!(completed.load(Ordering::SeqCst), 1);
@@ -381,14 +540,15 @@ mod tests {
     #[tokio::test]
     async fn reject_and_explicit_cancel_report_expected_codes() {
         fn reject<W: CancelStream>(stream: &H3WriteStream<W>) -> bool {
+            let error = ErrorCode::RequestRejected.stream("request rejected by GOAWAY");
             stream
                 .state
-                .goaway(|io| io.cancel(ErrorCode::RequestRejected.as_u64()))
+                .fail(error.clone(), |io| io.cancel(error.code.as_u64()))
         }
 
         let io = Io::default();
         let cancels = io.cancels.clone();
-        let mut stream = H3WriteStream::new(8, io);
+        let mut stream = H3WriteStream::new(8, io, events());
         assert!(reject(&stream));
         assert!(!reject(&stream));
         assert_eq!(
@@ -404,15 +564,25 @@ mod tests {
         let cancels = io.cancels.clone();
         let completed = Arc::new(AtomicUsize::new(0));
         let count = completed.clone();
-        let mut stream = H3WriteStream::new(12, io);
-        stream.on_finish(move || {
-            count.fetch_add(1, Ordering::SeqCst);
-        });
+        let stream = H3WriteStream::new(
+            12,
+            io,
+            Arc::new(move |event| {
+                let _ = event;
+                count.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
         (&stream).cancel(9);
-        assert_eq!(&*cancels.lock().unwrap(), &[9]);
+        assert_eq!(
+            &*cancels.lock().unwrap(),
+            &[ErrorCode::InternalError.as_u64()]
+        );
         assert_eq!(completed.load(Ordering::SeqCst), 1);
         (&stream).cancel(10);
-        assert_eq!(&*cancels.lock().unwrap(), &[9]);
+        assert_eq!(
+            &*cancels.lock().unwrap(),
+            &[ErrorCode::InternalError.as_u64()]
+        );
     }
 
     #[tokio::test]
@@ -430,11 +600,16 @@ mod tests {
         let request_completed = Arc::new(AtomicUsize::new(0));
         let completed = request_completed.clone();
         let shutdowns = request_shutdowns.clone();
-        let mut request_stream = H3WriteStream::new(0, request_io);
-        request_stream.on_finish(move || {
-            assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
-            completed.fetch_add(1, Ordering::SeqCst);
-        });
+        let request_stream = H3WriteStream::new(
+            0,
+            request_io,
+            Arc::new(move |event| {
+                if event.is_ok() {
+                    assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
         request_stream
             .write_request(request, crate::qpack::tests::qpack())
             .await
@@ -450,11 +625,16 @@ mod tests {
         let response_completed = Arc::new(AtomicUsize::new(0));
         let completed = response_completed.clone();
         let shutdowns = response_shutdowns.clone();
-        let mut response_stream = H3WriteStream::new(0, response_io);
-        response_stream.on_finish(move || {
-            assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
-            completed.fetch_add(1, Ordering::SeqCst);
-        });
+        let response_stream = H3WriteStream::new(
+            0,
+            response_io,
+            Arc::new(move |event| {
+                if event.is_ok() {
+                    assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
         response_stream
             .write_response(response, http::Method::GET, crate::qpack::tests::qpack())
             .await
@@ -476,7 +656,8 @@ mod tests {
         let request_io = Io::default();
         let request_cancels = request_io.cancels.clone();
         let request_writer = tokio::spawn(
-            H3WriteStream::new(0, request_io).write_request(request, crate::qpack::tests::qpack()),
+            H3WriteStream::new(0, request_io, events())
+                .write_request(request, crate::qpack::tests::qpack()),
         );
         tokio::task::yield_now().await;
         request_producer.cancel(ErrorCode::RequestCancelled.as_u64());
@@ -494,11 +675,12 @@ mod tests {
         let response: Response<crate::W> = http::Response::new(response_body).into();
         let response_io = Io::default();
         let response_cancels = response_io.cancels.clone();
-        let response_writer = tokio::spawn(H3WriteStream::new(0, response_io).write_response(
-            response,
-            http::Method::GET,
-            crate::qpack::tests::qpack(),
-        ));
+        let response_writer =
+            tokio::spawn(H3WriteStream::new(0, response_io, events()).write_response(
+                response,
+                http::Method::GET,
+                crate::qpack::tests::qpack(),
+            ));
         tokio::task::yield_now().await;
         response_producer.cancel(ErrorCode::RequestCancelled.as_u64());
         assert_eq!(
@@ -514,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn qpack_failure_reaches_request_and_response_producers() {
         let qpack = crate::qpack::tests::qpack();
-        qpack.on_connection_error(ErrorCode::InternalError.reason("qpack failed"));
+        qpack.on_connection_error(ErrorCode::InternalError.connection("qpack failed"));
 
         let request_body = crate::ArcWndBuf::new(1);
         let mut request_producer = request_body.clone();
@@ -523,7 +705,7 @@ mod tests {
             .body(request_body)
             .unwrap()
             .into();
-        let mut request_stream = H3WriteStream::new(0, Io::default());
+        let mut request_stream = H3WriteStream::new(0, Io::default(), events());
         request_stream.cancel(ErrorCode::NoError.as_u64());
         let error = request_stream
             .write_request(request, qpack.clone())
@@ -538,7 +720,7 @@ mod tests {
         let response_body = crate::ArcWndBuf::new(1);
         let mut response_producer = response_body.clone();
         let response: Response<crate::W> = http::Response::new(response_body).into();
-        let error = H3WriteStream::new(0, Io::default())
+        let error = H3WriteStream::new(0, Io::default(), events())
             .write_response(response, http::Method::GET, qpack)
             .await
             .unwrap_err();

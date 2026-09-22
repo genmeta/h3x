@@ -24,7 +24,8 @@ impl Encoder {
             state: State::new(
                 peer,
                 Box::new(|_| {
-                    Err(ErrorCode::InternalError.reason("instruction callback is not registered"))
+                    Err(ErrorCode::InternalError
+                        .connection("instruction callback is not registered"))
                 }),
             )?,
             completed: 0,
@@ -102,8 +103,9 @@ mod state {
         /// Pass default peer settings until SETTINGS arrives; all integer limits are 62-bit.
         pub(super) fn new(peer: Settings, on_instruction: super::OnInstruction) -> Result<Self> {
             if peer.blocked_streams > VARINT_MAX {
-                return Err(ErrorCode::SettingsError
-                    .reason("QPACK blocked-stream limit exceeds the QUIC variable-integer range"));
+                return Err(ErrorCode::SettingsError.connection(
+                    "QPACK blocked-stream limit exceeds the QUIC variable-integer range",
+                ));
             }
             Ok(Self {
                 table: DynamicTable::new(peer.max_table_capacity)?,
@@ -131,8 +133,9 @@ mod state {
             if peer.blocked_streams > VARINT_MAX
                 || peer.blocked_streams < self.potentially_blocked_streams() as u64
             {
-                return Err(ErrorCode::SettingsError
-                    .reason("QPACK blocked-stream limit exceeds the QUIC variable-integer range"));
+                return Err(ErrorCode::SettingsError.connection(
+                    "QPACK blocked-stream limit exceeds the QUIC variable-integer range",
+                ));
             }
             self.table.set_max_capacity(peer.max_table_capacity)?;
             self.max_blocked_streams = peer.blocked_streams;
@@ -147,8 +150,7 @@ mod state {
         ) -> Result<Bytes> {
             if stream_id > VARINT_MAX {
                 return Err(ErrorCode::InternalError
-                    .reason("encoded stream ID exceeds the QUIC variable-integer range")
-                    .stream());
+                    .stream("encoded stream ID exceeds the QUIC variable-integer range"));
             }
             let mut bounded = Vec::new();
             let mut size = 0usize;
@@ -159,9 +161,7 @@ mod state {
                     .and_then(|v| v.checked_add(32))
                     .filter(|&v| v as u64 <= self.max_field_section_size)
                     .ok_or_else(|| {
-                        ErrorCode::ExcessiveLoad
-                            .reason("field section exceeds the peer size limit")
-                            .stream()
+                        ErrorCode::ExcessiveLoad.stream("field section exceeds the peer size limit")
                     })?;
                 field.never_index |= should_never_index(&field.name);
                 bounded.push(field);
@@ -330,7 +330,7 @@ mod state {
             }
             if wire.len() > MAX_BUFFERED_FRAME_PAYLOAD {
                 return Err(ErrorCode::ExcessiveLoad
-                    .reason("encoded field section exceeds the buffer limit"));
+                    .connection("encoded field section exceeds the buffer limit"));
             }
             if required_insert_count != 0 {
                 self.unacked_sections_by_stream
@@ -364,7 +364,7 @@ mod state {
         ) -> Result<bool> {
             if self.table.max_capacity() == 0 {
                 return Err(ErrorCode::QpackEncoderStreamError
-                    .reason("cannot update a dynamic table with zero maximum capacity"));
+                    .connection("cannot update a dynamic table with zero maximum capacity"));
             }
             Vec::new().put_encoder_instruction(&instruction)?; // Validate wire limits before committing any table changes.
             // ponytail: preview on cloned table metadata; use an eviction plan if profiling warrants it.
@@ -393,14 +393,14 @@ mod state {
                         .get_mut(&stream_id)
                         .ok_or_else(|| {
                             ErrorCode::QpackDecoderStreamError
-                                .reason("acknowledgement refers to an unknown stream")
+                                .connection("acknowledgement refers to an unknown stream")
                         })?;
                     let section = sections.front().ok_or_else(|| {
                         ErrorCode::QpackDecoderStreamError
-                            .reason("acknowledgement has no outstanding field section")
+                            .connection("acknowledgement has no outstanding field section")
                     })?;
                     if section.required_insert_count > completed_insert_count {
-                        return Err(ErrorCode::QpackDecoderStreamError.reason(
+                        return Err(ErrorCode::QpackDecoderStreamError.connection(
                             "acknowledgement refers to inserts that have not been written",
                         ));
                     }
@@ -413,7 +413,7 @@ mod state {
                 }
                 DecoderInstruction::StreamCancellation(stream_id) => {
                     if stream_id > VARINT_MAX {
-                        return Err(ErrorCode::QpackDecoderStreamError.reason(
+                        return Err(ErrorCode::QpackDecoderStreamError.connection(
                             "cancelled stream ID exceeds the QUIC variable-integer range",
                         ));
                     }
@@ -424,7 +424,7 @@ mod state {
                         .known_received_count
                         .checked_add(increment)
                         .filter(|&count| increment != 0 && count <= completed_insert_count)
-                        .ok_or_else(|| ErrorCode::QpackDecoderStreamError.reason("insert-count increment is zero, overflows, or exceeds completed writes"))?;
+                        .ok_or_else(|| ErrorCode::QpackDecoderStreamError.connection("insert-count increment is zero, overflows, or exceeds completed writes"))?;
                 }
             }
             Ok(())
@@ -636,7 +636,8 @@ mod tests {
         }
 
         let (mut fallback, _) = configured(128, 1);
-        fallback.on_instruction(|_| Err(ErrorCode::ExcessiveLoad.reason("full instruction queue")));
+        fallback
+            .on_instruction(|_| Err(ErrorCode::ExcessiveLoad.connection("full instruction queue")));
         assert!(
             !fallback
                 .encode(0, vec![field(b"x-fallback", b"value", false)])
@@ -645,7 +646,7 @@ mod tests {
         );
 
         fallback.on_instruction(|_| {
-            Err(ErrorCode::ClosedCriticalStream.reason("closed instruction queue"))
+            Err(ErrorCode::ClosedCriticalStream.connection("closed instruction queue"))
         });
         assert_eq!(
             fallback

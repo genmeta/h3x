@@ -2,6 +2,8 @@
 
 use std::{
     future::poll_fn,
+    io,
+    pin::Pin,
     sync::{Arc, Mutex},
     task::Poll,
 };
@@ -101,7 +103,7 @@ impl ArcQpack {
             error = self.failed() => Err(error),
             result = async {
                 let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                    ErrorCode::StreamCreationError.reason("unable to create the required stream")
+                    ErrorCode::StreamCreationError.connection("unable to create the required stream")
                 })?;
                 self.write_encoder(instructions, &mut send).await
             } => result,
@@ -123,7 +125,7 @@ impl ArcQpack {
             error = self.failed() => Err(error),
             result = async {
                 let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
-                    ErrorCode::StreamCreationError.reason("unable to create the required stream")
+                    ErrorCode::StreamCreationError.connection("unable to create the required stream")
                 })?;
                 self.write_decoder(instructions, &mut send).await
             } => result,
@@ -155,7 +157,7 @@ impl ArcQpack {
 
     fn critical_stream_error(&self) -> Error {
         self.error().unwrap_or_else(|| {
-            ErrorCode::ClosedCriticalStream.reason("critical HTTP/3 stream closed")
+            ErrorCode::ClosedCriticalStream.connection("critical HTTP/3 stream closed")
         })
     }
 
@@ -192,7 +194,7 @@ impl ArcQpack {
     /// Error scope is selected by the caller from the context in which the
     /// error occurred; an HTTP/3 error code alone does not determine it.
     pub fn on_stream_error(&self, id: u64, error: Error) -> Error {
-        if let Err(cancel_error) = self.cancel_decode(id) {
+        if let Err(cancel_error) = self.cancel_decode(vec![id]) {
             return self.on_connection_error(cancel_error);
         }
         error.stream()
@@ -263,8 +265,8 @@ impl ArcQpack {
         .await
     }
 
-    pub fn cancel_decode(&self, id: u64) -> Result<()> {
-        let wakes = self.with_state(|state| state.decoder.cancel(id))?;
+    pub fn cancel_decode(&self, ids: Vec<u64>) -> Result<()> {
+        let wakes = self.with_state(|state| state.decoder.cancel(ids))?;
         for wake in wakes {
             wake.wake();
         }
@@ -309,18 +311,56 @@ impl ArcQpack {
             for instruction in batch {
                 buf.clear();
                 buf.put_encoder_instruction(&instruction)?;
-                writer.write_all(&buf).await.map_err(|error| {
-                    crate::Error::from_io(error, ErrorCode::ClosedCriticalStream)
-                })?;
-                if !matches!(instruction, EncoderInstruction::SetDynamicTableCapacity(_)) {
-                    self.with_state(|state| {
-                        state.encoder.record_insert_written();
-                        Ok(())
+                if matches!(instruction, EncoderInstruction::SetDynamicTableCapacity(_)) {
+                    writer.write_all(&buf).await.map_err(|error| {
+                        crate::Error::from_io(error, ErrorCode::ClosedCriticalStream)
                     })?;
+                } else {
+                    self.write_insert(writer, &buf).await?;
                 }
             }
         }
         Err(self.critical_stream_error())
+    }
+
+    /// Make the final bytes of an insertion and its completion count visible in
+    /// the same order to decoder feedback. The lock is released whenever the
+    /// transport cannot accept more bytes immediately.
+    async fn write_insert<W: AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let mut offset = 0;
+        poll_fn(|cx| {
+            let mut shared = self.lock().unwrap();
+            let state = match &mut *shared {
+                Ok(state) => state,
+                Err(error) => return Poll::Ready(Err(error.clone())),
+            };
+            match Pin::new(&mut *writer).poll_write(cx, &bytes[offset..]) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(error)) => Poll::Ready(Err(crate::Error::from_io(
+                    error,
+                    ErrorCode::ClosedCriticalStream,
+                ))),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(crate::Error::from_io(
+                    io::ErrorKind::WriteZero.into(),
+                    ErrorCode::ClosedCriticalStream,
+                ))),
+                Poll::Ready(Ok(written)) => {
+                    offset += written;
+                    if offset == bytes.len() {
+                        state.encoder.record_insert_written();
+                        Poll::Ready(Ok(()))
+                    } else {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                }
+            }
+        })
+        .await
     }
 
     pub(crate) async fn write_decoder<W: AsyncWrite + Unpin>(
@@ -378,10 +418,10 @@ impl Drop for StreamDecoder<'_> {
 pub(super) fn instruction_send_error<T>(error: tokio::sync::mpsc::error::TrySendError<T>) -> Error {
     match error {
         tokio::sync::mpsc::error::TrySendError::Full(_) => {
-            ErrorCode::ExcessiveLoad.reason("QPACK instruction queue is full")
+            ErrorCode::ExcessiveLoad.connection("QPACK instruction queue is full")
         }
         tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-            ErrorCode::ClosedCriticalStream.reason("QPACK instruction receiver is closed")
+            ErrorCode::ClosedCriticalStream.connection("QPACK instruction receiver is closed")
         }
     }
 }
@@ -391,8 +431,13 @@ pub(crate) mod tests {
     use std::{
         io,
         pin::Pin,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            TryLockError,
+            atomic::{AtomicUsize, Ordering},
+            mpsc as std_mpsc,
+        },
         task::{Context, Poll},
+        thread,
     };
 
     use codec::instruction::DecoderInstruction;
@@ -414,6 +459,12 @@ pub(crate) mod tests {
 
     struct FailingWriter;
 
+    struct FeedbackInterleavingWriter {
+        writes: usize,
+        insertion_visible: Option<std_mpsc::Sender<()>>,
+        feedback_saw_lock: std_mpsc::Receiver<bool>,
+    }
+
     impl AsyncWrite for FailingWriter {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -429,6 +480,32 @@ pub(crate) mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Err(io::Error::other("shutdown failed")))
+        }
+    }
+
+    impl AsyncWrite for FeedbackInterleavingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            if self.writes == 3 {
+                self.insertion_visible.take().unwrap().send(()).unwrap();
+                assert!(
+                    self.feedback_saw_lock.recv().unwrap(),
+                    "QPACK feedback could acquire the state lock before the insertion was recorded"
+                );
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -505,19 +582,19 @@ pub(crate) mod tests {
         }
 
         async fn accept_bi(&self) -> Result<(u64, (TestIo, TestIo))> {
-            Err(ErrorCode::InternalError.reason("unused"))
+            Err(ErrorCode::InternalError.connection("unused"))
         }
 
         async fn open_uni(&self) -> Result<Option<(u64, TestIo)>> {
             match self.mode {
                 0 => Ok(None),
                 1 => Ok(Some((2, TestIo))),
-                _ => Err(ErrorCode::InternalError.reason("open failed")),
+                _ => Err(ErrorCode::InternalError.connection("open failed")),
             }
         }
 
         async fn accept_uni(&self) -> Result<(u64, TestIo)> {
-            Err(ErrorCode::InternalError.reason("unused"))
+            Err(ErrorCode::InternalError.connection("unused"))
         }
 
         fn close(&self, _: String, _: u64) -> Result<()> {
@@ -582,8 +659,8 @@ pub(crate) mod tests {
         };
         tokio::task::yield_now().await;
 
-        let first = ErrorCode::QpackDecompressionFailed.reason("first");
-        let second = ErrorCode::InternalError.reason("second");
+        let first = ErrorCode::QpackDecompressionFailed.connection("first");
+        let second = ErrorCode::InternalError.connection("second");
         assert_eq!(qpack.on_connection_error(first.clone()).reason, "first");
         assert_eq!(qpack.on_connection_error(second).reason, "first");
         assert_eq!(waiting.await.unwrap().reason, "first");
@@ -614,12 +691,12 @@ pub(crate) mod tests {
                 Ok(())
             })
             .unwrap();
-        let stream_error = ErrorCode::InternalError.reason("stream").stream();
+        let stream_error = ErrorCode::InternalError.stream("stream");
         let stream_error = qpack.on_stream_error(0, stream_error.clone());
         assert!(matches!(stream_error, Error::Stream(_)));
         assert!(qpack.error().is_none());
 
-        let connection_error = ErrorCode::InternalError.reason("connection");
+        let connection_error = ErrorCode::InternalError.connection("connection");
         let connection_error = qpack.on_connection_error(connection_error);
         assert!(matches!(connection_error, Error::Connection(_)));
         assert_eq!(qpack.error(), Some(connection_error));
@@ -668,7 +745,7 @@ pub(crate) mod tests {
             ErrorCode::ClosedCriticalStream
         );
 
-        let failed = ErrorCode::InternalError.reason("already failed");
+        let failed = ErrorCode::InternalError.connection("already failed");
         qpack.on_connection_error(failed.clone());
         let (_, encoder_rx) = tokio::sync::mpsc::channel(1);
         assert_eq!(
@@ -678,6 +755,83 @@ pub(crate) mod tests {
                 .unwrap_err(),
             failed
         );
+    }
+
+    #[tokio::test]
+    async fn insertion_write_and_completion_are_ordered_before_decoder_feedback() {
+        let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
+        let queued = Arc::new(Mutex::new(Vec::new()));
+        let captured = queued.clone();
+        qpack
+            .with_state(|state| {
+                state.encoder.on_instruction(move |batch| {
+                    captured.lock().unwrap().push(batch);
+                    Ok(())
+                });
+                Ok(())
+            })
+            .unwrap();
+        qpack
+            .configure(
+                Settings {
+                    max_table_capacity: 128,
+                    blocked_streams: 1,
+                },
+                4096,
+            )
+            .unwrap();
+        qpack
+            .encode(0, vec![field(b"x-interleaved", b"value", false)])
+            .unwrap();
+
+        let (instruction_tx, instruction_rx) = tokio::sync::mpsc::channel(2);
+        let batches = std::mem::take(&mut *queued.lock().unwrap());
+        assert_eq!(batches.len(), 2);
+        for batch in batches {
+            instruction_tx.send(batch).await.unwrap();
+        }
+        drop(instruction_tx);
+
+        let (visible_tx, visible_rx) = std_mpsc::channel();
+        let (lock_tx, lock_rx) = std_mpsc::channel();
+        let feedback_qpack = qpack.clone();
+        let feedback = thread::spawn(move || {
+            visible_rx.recv().unwrap();
+            let apply = |state: &mut Qpack| {
+                state
+                    .encoder
+                    .on_decoder_instruction(DecoderInstruction::InsertCountIncrement(1))?;
+                state
+                    .encoder
+                    .on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0))
+            };
+            match feedback_qpack.try_lock() {
+                Ok(mut shared) => {
+                    lock_tx.send(false).unwrap();
+                    apply(shared.as_mut().unwrap())
+                }
+                Err(TryLockError::WouldBlock) => {
+                    lock_tx.send(true).unwrap();
+                    feedback_qpack.with_state(apply)
+                }
+                Err(TryLockError::Poisoned(_)) => panic!("QPACK state lock was poisoned"),
+            }
+        });
+        let mut writer = FeedbackInterleavingWriter {
+            writes: 0,
+            insertion_visible: Some(visible_tx),
+            feedback_saw_lock: lock_rx,
+        };
+
+        assert_eq!(
+            qpack
+                .write_encoder(instruction_rx, &mut writer)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::ClosedCriticalStream
+        );
+        feedback.join().unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -830,7 +984,7 @@ pub(crate) mod tests {
             tokio::spawn(async move { qpack.decode(4, wire.into()).await })
         };
         tokio::task::yield_now().await;
-        qpack.cancel_decode(4).unwrap();
+        qpack.cancel_decode(vec![4]).unwrap();
         assert_eq!(
             decoding.await.unwrap().unwrap_err().code,
             ErrorCode::RequestCancelled
@@ -870,7 +1024,7 @@ pub(crate) mod tests {
         let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
         assert_eq!(
             qpack
-                .on_stream_error(0, ErrorCode::NoError.reason("cancel"))
+                .on_stream_error(0, ErrorCode::NoError.connection("cancel"))
                 .code,
             ErrorCode::InternalError
         );

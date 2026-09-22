@@ -19,7 +19,7 @@ pub(super) async fn be_string_literal<T: AsyncRead + Unpin + ?Sized>(
 ) -> Result<Bytes> {
     validate_prefix_bits(prefix_bits).map_err(|error| {
         ErrorCode::QpackEncoderStreamError
-            .reason(format!("invalid encoder string prefix width: {error}"))
+            .connection(format!("invalid encoder string prefix width: {error}"))
     })?;
     let first = be_byte(reader).await?;
     be_string_literal_with_first(reader, first, prefix_bits).await
@@ -33,7 +33,7 @@ pub(super) async fn be_string_literal_with_first<T: AsyncRead + Unpin + ?Sized>(
 ) -> Result<Bytes> {
     validate_prefix_bits(prefix_bits).map_err(|error| {
         ErrorCode::QpackEncoderStreamError
-            .reason(format!("invalid encoder string prefix width: {error}"))
+            .connection(format!("invalid encoder string prefix width: {error}"))
     })?;
     let length = be_prefixed_integer_with_first(
         reader,
@@ -43,9 +43,8 @@ pub(super) async fn be_string_literal_with_first<T: AsyncRead + Unpin + ?Sized>(
     )
     .await?;
     if length > MAX_BUFFERED_FRAME_PAYLOAD as u64 {
-        return Err(
-            ErrorCode::ExcessiveLoad.reason("encoded string literal exceeds the buffer limit")
-        );
+        return Err(ErrorCode::QpackEncoderStreamError
+            .connection("encoded string literal exceeds the buffer limit"));
     }
     let mut encoded = vec![0; length as usize];
     reader
@@ -55,15 +54,14 @@ pub(super) async fn be_string_literal_with_first<T: AsyncRead + Unpin + ?Sized>(
     let value = if first & (1 << (prefix_bits - 1)) != 0 {
         decode_huffman(&encoded).map_err(|error| {
             ErrorCode::QpackEncoderStreamError
-                .reason(format!("invalid encoder Huffman string: {error}"))
+                .connection(format!("invalid encoder Huffman string: {error}"))
         })?
     } else {
         Bytes::from(encoded)
     };
     if value.len() > MAX_BUFFERED_FRAME_PAYLOAD {
-        return Err(
-            ErrorCode::ExcessiveLoad.reason("decoded string literal exceeds the buffer limit")
-        );
+        return Err(ErrorCode::QpackEncoderStreamError
+            .connection("decoded string literal exceeds the buffer limit"));
     }
     Ok(value)
 }
@@ -72,16 +70,17 @@ pub(super) async fn be_string_literal_with_first<T: AsyncRead + Unpin + ?Sized>(
 pub(super) fn be_string_literal_slice(input: &[u8], prefix_bits: u8) -> Result<(&[u8], Bytes)> {
     validate_prefix_bits(prefix_bits)?;
     let first = *input.first().ok_or_else(|| {
-        ErrorCode::QpackDecompressionFailed.reason("string literal is missing its first byte")
+        ErrorCode::QpackDecompressionFailed.connection("string literal is missing its first byte")
     })?;
     let (input, length) = be_prefixed_integer(input, prefix_bits - 1)?;
     let length = usize::try_from(length).map_err(|error| {
-        ErrorCode::QpackDecompressionFailed
-            .reason(format!("string length does not fit in memory: {error}"))
+        ErrorCode::QpackDecompressionFailed.stream(format!(
+            "string length exceeds the implementation limit: {error}"
+        ))
     })?;
     let (encoded, rest) = input.split_at_checked(length).ok_or_else(|| {
         ErrorCode::QpackDecompressionFailed
-            .reason("string literal is shorter than its declared length")
+            .connection("string literal is shorter than its declared length")
     })?;
     let value = if first & (1 << (prefix_bits - 1)) != 0 {
         decode_huffman(encoded)?
@@ -106,7 +105,7 @@ impl<B: BufMut> WriteStringLiteral for B {
         let prefix_mask = (1u16 << prefix_bits) - 1;
         if u16::from(high_bits) & prefix_mask != 0 {
             return Err(ErrorCode::QpackDecompressionFailed
-                .reason("string literal high bits overlap its prefix"));
+                .connection("string literal high bits overlap its prefix"));
         }
         self.put_prefixed_integer(value.len() as u64, prefix_bits - 1, high_bits)?;
         self.put_slice(value);
@@ -117,7 +116,7 @@ impl<B: BufMut> WriteStringLiteral for B {
 fn validate_prefix_bits(prefix_bits: u8) -> Result<()> {
     if !(2..=8).contains(&prefix_bits) {
         return Err(ErrorCode::QpackDecompressionFailed
-            .reason("string literal prefix width must be between 2 and 8"));
+            .connection("string literal prefix width must be between 2 and 8"));
     }
     Ok(())
 }
@@ -126,7 +125,7 @@ fn decode_huffman(encoded: &[u8]) -> Result<Bytes> {
     let mut decoded = Vec::new();
     httlib_huffman::decode(encoded, &mut decoded, DecoderSpeed::FourBits).map_err(|error| {
         ErrorCode::QpackDecompressionFailed
-            .reason(format!("invalid Huffman string encoding: {error}"))
+            .connection(format!("invalid Huffman string encoding: {error}"))
     })?;
     Ok(Bytes::from(decoded))
 }
@@ -197,13 +196,11 @@ mod tests {
             .put_prefixed_integer(MAX_BUFFERED_FRAME_PAYLOAD as u64 + 1, 7, 0)
             .unwrap();
         let first = oversized.remove(0);
-        assert_eq!(
-            be_string_literal_with_first(&mut oversized.as_slice(), first, 8)
-                .await
-                .unwrap_err()
-                .code,
-            ErrorCode::ExcessiveLoad
-        );
+        let error = be_string_literal_with_first(&mut oversized.as_slice(), first, 8)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::QpackEncoderStreamError);
+        assert!(matches!(error, crate::Error::Connection(_)));
         assert_eq!(
             be_string_literal(&mut &[2, b'a'][..], 8)
                 .await
@@ -249,13 +246,11 @@ mod tests {
         wire.put_prefixed_integer(huffman.len() as u64, 7, 0x80)
             .unwrap();
         wire.extend_from_slice(&huffman);
-        assert_eq!(
-            be_string_literal(&mut wire.as_slice(), 8)
-                .await
-                .unwrap_err()
-                .code,
-            ErrorCode::ExcessiveLoad
-        );
+        let error = be_string_literal(&mut wire.as_slice(), 8)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::QpackEncoderStreamError);
+        assert!(matches!(error, crate::Error::Connection(_)));
     }
 
     #[test]

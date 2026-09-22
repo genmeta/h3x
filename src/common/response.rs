@@ -121,29 +121,29 @@ impl Response<Read> {
 
         for field in fields {
             if field.name.iter().any(u8::is_ascii_uppercase) {
-                return Err(ErrorCode::MessageError.reason("uppercase field name"));
+                return Err(ErrorCode::MessageError.stream("uppercase field name"));
             }
             if !response.headers().is_empty() && field.name.starts_with(b":") {
                 return Err(
-                    ErrorCode::MessageError.reason("pseudo-header after regular header field")
+                    ErrorCode::MessageError.stream("pseudo-header after regular header field")
                 );
             }
             match field.name.as_ref() {
                 b":status" => {
                     let value = StatusCode::from_bytes(&field.value)
-                        .map_err(|_| ErrorCode::MessageError.reason("invalid :status"))?;
+                        .map_err(|_| ErrorCode::MessageError.stream("invalid :status"))?;
                     if status.replace(value).is_some() {
-                        return Err(ErrorCode::MessageError.reason("duplicate :status"));
+                        return Err(ErrorCode::MessageError.stream("duplicate :status"));
                     }
                 }
                 name if name.starts_with(b":") => {
-                    return Err(ErrorCode::MessageError.reason("undefined response pseudo-header"));
+                    return Err(ErrorCode::MessageError.stream("undefined response pseudo-header"));
                 }
                 name => {
                     let name = HeaderName::from_bytes(name)
-                        .map_err(|_| ErrorCode::MessageError.reason("invalid header name"))?;
+                        .map_err(|_| ErrorCode::MessageError.stream("invalid header name"))?;
                     let mut value = HeaderValue::from_bytes(&field.value)
-                        .map_err(|_| ErrorCode::MessageError.reason("invalid header value"))?;
+                        .map_err(|_| ErrorCode::MessageError.stream("invalid header value"))?;
                     value.set_sensitive(field.never_index);
                     response.headers_mut().append(name, value);
                 }
@@ -151,7 +151,7 @@ impl Response<Read> {
         }
 
         *response.status_mut() =
-            status.ok_or_else(|| ErrorCode::MessageError.reason("missing or invalid :status"))?;
+            status.ok_or_else(|| ErrorCode::MessageError.stream("missing or invalid :status"))?;
         *response.version_mut() = http::Version::HTTP_3;
         Ok(Self::from_parts(response.into_parts().0, body))
     }

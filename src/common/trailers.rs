@@ -39,16 +39,16 @@ impl Trailers {
         for field in fields {
             if field.name.starts_with(b":") {
                 return Err(
-                    ErrorCode::MessageError.reason("pseudo-header is not allowed in trailers")
+                    ErrorCode::MessageError.stream("pseudo-header is not allowed in trailers")
                 );
             }
             if field.name.iter().any(u8::is_ascii_uppercase) {
-                return Err(ErrorCode::MessageError.reason("uppercase field name"));
+                return Err(ErrorCode::MessageError.stream("uppercase field name"));
             }
             let name = HeaderName::from_lowercase(&field.name)
-                .map_err(|_| ErrorCode::MessageError.reason("invalid trailer name"))?;
+                .map_err(|_| ErrorCode::MessageError.stream("invalid trailer name"))?;
             let mut value = HeaderValue::from_bytes(&field.value)
-                .map_err(|_| ErrorCode::MessageError.reason("invalid trailer value"))?;
+                .map_err(|_| ErrorCode::MessageError.stream("invalid trailer value"))?;
             value.set_sensitive(field.never_index);
             trailers.append(name, value);
         }

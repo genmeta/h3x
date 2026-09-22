@@ -70,13 +70,6 @@ pub(crate) fn embedded_h3_error(error: &io::Error) -> Option<Error> {
 }
 
 impl Error {
-    pub fn new(code: ErrorCode, reason: impl Into<String>) -> Self {
-        Self::Connection(ErrorDetail {
-            code,
-            reason: reason.into(),
-        })
-    }
-
     /// Preserve embedded protocol errors, using `fallback` for plain I/O failures.
     pub(crate) fn from_io(error: io::Error, code: ErrorCode) -> Self {
         Self::from_io_with(error, |_| code)
@@ -93,7 +86,8 @@ impl Error {
             .get_ref()
             .and_then(|error| error.downcast_ref::<Arc<io::Error>>())
             .map_or(&error, Arc::as_ref);
-        embedded_h3_error(error).unwrap_or_else(|| fallback(error.kind()).reason(error.to_string()))
+        embedded_h3_error(error)
+            .unwrap_or_else(|| fallback(error.kind()).connection(error.to_string()))
     }
 }
 
@@ -141,9 +135,20 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// Attach context explaining why this protocol error occurred.
-    pub fn reason(self, reason: impl Into<String>) -> Error {
-        Error::new(self, reason)
+    /// Create an error that aborts only the affected request stream.
+    pub fn stream(self, reason: impl Into<String>) -> Error {
+        Error::Stream(ErrorDetail {
+            code: self,
+            reason: reason.into(),
+        })
+    }
+
+    /// Create an error that terminates the HTTP/3 connection.
+    pub fn connection(self, reason: impl Into<String>) -> Error {
+        Error::Connection(ErrorDetail {
+            code: self,
+            reason: reason.into(),
+        })
     }
 
     pub const fn as_u64(self) -> u64 {
@@ -202,10 +207,13 @@ mod tests {
 
     #[test]
     fn conversions_preserve_protocol_errors_and_cover_every_registered_code() {
-        let protocol = ErrorCode::IdError.reason("id");
-        assert_eq!(ErrorCode::from(protocol.clone()), ErrorCode::IdError);
+        let stream = ErrorCode::RequestRejected.stream("rejected");
+        assert!(matches!(stream, Error::Stream(_)));
+        let connection = ErrorCode::IdError.connection("id");
+        assert!(matches!(connection, Error::Connection(_)));
+        assert_eq!(ErrorCode::from(connection.clone()), ErrorCode::IdError);
         assert_eq!(
-            ErrorCode::from(io::Error::other(protocol)),
+            ErrorCode::from(io::Error::other(connection)),
             ErrorCode::IdError
         );
         for code in 0x100..=0x110 {
