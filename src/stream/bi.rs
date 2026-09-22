@@ -15,9 +15,7 @@ use futures::task::AtomicWaker;
 use qbase::{ArcReceiving, sid::StreamId};
 use qrecovery::{recv::StopSending, send::CancelStream};
 
-use super::{
-    ArcH3Stream, H3ReadStream, H3WriteStream, StreamEvent, StreamEventHandler, view::StreamView,
-};
+use super::{ArcH3Stream, H3ReadStream, H3WriteStream, StreamEventHandler, view::StreamView};
 use crate::{ArcQpack, Error, ErrorCode, Result, Role};
 
 /// Admission boundaries and registered streams share the connection's lock.
@@ -53,7 +51,6 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
         self.try_wake();
     }
 
-    #[cfg(test)]
     pub(crate) fn local_not_goway(&self) -> Result<()> {
         self.view.local_not_goaway()
     }
@@ -63,6 +60,7 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
     }
 
     pub(crate) fn accept(&mut self, id: StreamId) -> Result<()> {
+        self.view.local_not_goaway()?;
         self.view.accept(id)
     }
 
@@ -75,14 +73,15 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
     }
 
     fn reject_from(&mut self, id: u64, qpack: &ArcQpack) -> Result<()> {
+        let error = ErrorCode::RequestRejected.stream("request rejected by GOAWAY");
         let mut rejected = HashSet::new();
         for (id, read) in remove_rejected(&mut self.reads, id) {
-            if read.goaway(|io| io.stop(ErrorCode::RequestRejected.as_u64())) {
+            if read.fail(error.clone(), |io| io.stop(error.code.as_u64())) {
                 rejected.insert(id);
             }
         }
         for (id, write) in remove_rejected(&mut self.writes, id) {
-            if write.goaway(|io| io.cancel(ErrorCode::RequestRejected.as_u64())) {
+            if write.fail(error.clone(), |io| io.cancel(error.code.as_u64())) {
                 rejected.insert(id);
             }
         }
@@ -109,10 +108,10 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
         let reads = mem::take(&mut self.reads);
         let writes = mem::take(&mut self.writes);
         for read in reads.into_values() {
-            read.terminate(|io| io.stop(error.code.as_u64()));
+            read.fail(error.clone(), |io| io.stop(error.code.as_u64()));
         }
         for write in writes.into_values() {
-            write.terminate(|io| io.cancel(error.code.as_u64()));
+            write.fail(error.clone(), |io| io.cancel(error.code.as_u64()));
         }
         self.try_wake();
     }
@@ -160,10 +159,6 @@ impl ArcDrain {
         self.0.lock().unwrap().clean_if(predicet);
     }
 
-    fn dirty(&self) {
-        self.0.lock().unwrap().dirty();
-    }
-
     fn goaway(&self) {
         self.0.lock().unwrap().goaway();
     }
@@ -181,10 +176,6 @@ impl Drain {
 
     fn goaway(&self) {
         self.gone.fetch_or(Self::GONE, Ordering::AcqRel);
-    }
-
-    fn dirty(&self) {
-        self.gone.fetch_and(!Self::CLEAN, Ordering::AcqRel);
     }
 
     fn clean_if(&self, predicet: impl Fn() -> bool) {
@@ -217,39 +208,69 @@ where
     R: StopSending + Send + 'static,
     W: CancelStream + Send + 'static,
 {
-    fn on_read_aborted(streams: &Mutex<BiStreams<R, W>>, qpack: &ArcQpack, id: u64, code: u64) {
+    fn fail_connection(streams: &Mutex<BiStreams<R, W>>, qpack: &ArcQpack, error: Error) {
+        let error = qpack.on_connection_error(error);
+        streams.lock().unwrap().close(error);
+    }
+
+    fn on_read_event(
+        streams: &Mutex<BiStreams<R, W>>,
+        qpack: &ArcQpack,
+        id: u64,
+        event: Result<()>,
+    ) {
         let write = {
             let mut guard = streams.lock().unwrap();
             let write = guard.writes.get(&id).cloned();
             guard.remove_read(id);
             write
         };
-        if code != ErrorCode::NoError.as_u64()
-            && write.is_some_and(|write| write.terminate(|io| io.cancel(code)))
+        let Err(error) = event else {
+            return;
+        };
+        if error.is_connection() {
+            Self::fail_connection(streams, qpack, error);
+            return;
+        }
+        if error.code != ErrorCode::NoError
+            && write
+                .is_some_and(|write| write.fail(error.clone(), |io| io.cancel(error.code.as_u64())))
         {
             streams.lock().unwrap().remove_write(id);
         }
         if let Err(error) = qpack.cancel_decode(vec![id]) {
-            qpack.on_connection_error(error);
+            Self::fail_connection(streams, qpack, error);
         }
     }
 
-    fn on_write_aborted(streams: &Mutex<BiStreams<R, W>>, qpack: &ArcQpack, id: u64, code: u64) {
+    fn on_write_event(
+        streams: &Mutex<BiStreams<R, W>>,
+        qpack: &ArcQpack,
+        id: u64,
+        event: Result<()>,
+    ) {
         let read = {
             let mut guard = streams.lock().unwrap();
             let read = guard.reads.get(&id).cloned();
             guard.remove_write(id);
             read
         };
-        if code != ErrorCode::NoError.as_u64()
-            && read.is_some_and(|read| read.terminate(|io| io.stop(code)))
+        let Err(error) = event else {
+            return;
+        };
+        if error.is_connection() {
+            Self::fail_connection(streams, qpack, error);
+            return;
+        }
+        if error.code != ErrorCode::NoError
+            && read.is_some_and(|read| read.fail(error.clone(), |io| io.stop(error.code.as_u64())))
         {
             streams.lock().unwrap().remove_read(id);
         }
-        if code != ErrorCode::NoError.as_u64()
+        if error.code != ErrorCode::NoError
             && let Err(error) = qpack.cancel_decode(vec![id])
         {
-            qpack.on_connection_error(error);
+            Self::fail_connection(streams, qpack, error);
         }
     }
 
@@ -257,12 +278,7 @@ where
         let streams = Arc::downgrade(&self.inner);
         Arc::new(move |event| {
             if let Some(streams) = streams.upgrade() {
-                match event {
-                    StreamEvent::Finished => streams.lock().unwrap().remove_read(id),
-                    StreamEvent::Aborted { code } => {
-                        Self::on_read_aborted(&streams, &qpack, id, code)
-                    }
-                }
+                Self::on_read_event(&streams, &qpack, id, event);
             }
         })
     }
@@ -271,12 +287,7 @@ where
         let streams = Arc::downgrade(&self.inner);
         Arc::new(move |event| {
             if let Some(streams) = streams.upgrade() {
-                match event {
-                    StreamEvent::Finished => streams.lock().unwrap().remove_write(id),
-                    StreamEvent::Aborted { code } => {
-                        Self::on_write_aborted(&streams, &qpack, id, code)
-                    }
-                }
+                Self::on_write_event(&streams, &qpack, id, event);
             }
         })
     }
@@ -290,10 +301,6 @@ where
         send: W,
         qpack: ArcQpack,
     ) -> (H3ReadStream<R>, H3WriteStream<W>) {
-        // A stream may be opened after local GOAWAY and before peer GOAWAY.
-        // Such a stream invalidates any CLEAN state recorded while the registry
-        // was temporarily empty.
-        guard.drain.dirty();
         let read = H3ReadStream::new(id, recv, self.read_event_handler(id, qpack.clone()));
         let write = H3WriteStream::new(id, send, self.write_event_handler(id, qpack));
         guard.reads.insert(id, read.state.clone());

@@ -4,105 +4,39 @@ pub(crate) mod view;
 pub(crate) mod write;
 
 use std::{
-    io, mem,
-    pin::Pin,
+    mem,
     sync::{Arc, Mutex},
-    task::{Context, Poll, Waker},
+    task::Waker,
 };
 
 pub(crate) use read::H3ReadStream;
 pub(crate) use write::H3WriteStream;
 
-use crate::ErrorCode;
+use crate::Error;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StreamEvent {
-    Finished,
-    Aborted { code: u64 },
-}
-
+/// Completion of one transport direction: `Ok` for a normal finish and
+/// `Err` for an H3 failure that still needs to be propagated.
+pub(crate) type StreamEvent = crate::Result<()>;
 pub(crate) type StreamEventHandler = Arc<dyn Fn(StreamEvent) + Send + Sync>;
 
-/// A GOAWAY boundary rejected this request; other errors come from transport I/O.
+/// Normal state of one transport half. Failures live in the surrounding
+/// `Result<H3Stream<T>, Error>` so every abnormal terminal state retains its
+/// complete H3 error.
 #[derive(Debug)]
-pub(crate) struct Goaway;
-
-/// State of one transport half, independent of its application handle.
 pub(crate) enum H3Stream<T> {
     Idle(T),
     Polling(T, Waker),
-    Finished(T),
-    Terminated,
+    Finished,
     Transition,
 }
 
 impl<T> H3Stream<T> {
     fn is_finished(&self) -> bool {
-        matches!(self, Self::Finished(_) | Self::Terminated)
-    }
-
-    fn terminate(&mut self, f: impl FnOnce(&mut T)) -> Option<Waker> {
-        match mem::replace(self, Self::Transition) {
-            Self::Idle(mut io) => {
-                f(&mut io);
-                *self = Self::Terminated;
-                None
-            }
-            Self::Polling(mut io, waker) => {
-                f(&mut io);
-                *self = Self::Terminated;
-                Some(waker)
-            }
-            finished @ Self::Finished(_) => {
-                *self = finished;
-                None
-            }
-            Self::Terminated => {
-                *self = Self::Terminated;
-                None
-            }
-            Self::Transition => unreachable!(),
-        }
-    }
-
-    fn finish(&mut self) {
-        *self = match mem::replace(self, Self::Transition) {
-            Self::Idle(io) | Self::Polling(io, _) | Self::Finished(io) => Self::Finished(io),
-            Self::Terminated => Self::Terminated,
-            Self::Transition => unreachable!(),
-        };
-    }
-
-    fn poll_io<O>(
-        &mut self,
-        cx: &mut Context<'_>,
-        f: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<O>>,
-    ) -> Poll<io::Result<O>>
-    where
-        T: Unpin,
-    {
-        let (mut io, finished) = match mem::replace(self, Self::Transition) {
-            Self::Idle(io) | Self::Polling(io, _) => (io, false),
-            Self::Finished(io) => (io, true),
-            Self::Terminated => {
-                *self = Self::Terminated;
-                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
-            }
-            Self::Transition => unreachable!(),
-        };
-        let result = f(Pin::new(&mut io), cx);
-        *self = if finished {
-            Self::Finished(io)
-        } else if result.is_pending() {
-            Self::Polling(io, cx.waker().clone())
-        } else {
-            Self::Idle(io)
-        };
-        result
+        matches!(self, Self::Finished)
     }
 }
 
-pub(crate) struct ArcH3Stream<T>(Arc<Mutex<Result<H3Stream<T>, Goaway>>>);
+pub(crate) struct ArcH3Stream<T>(Arc<Mutex<crate::Result<H3Stream<T>>>>);
 
 impl<T> Clone for ArcH3Stream<T> {
     fn clone(&self) -> Self {
@@ -115,12 +49,27 @@ impl<T> ArcH3Stream<T> {
         Self(Arc::new(Mutex::new(Ok(H3Stream::Idle(io)))))
     }
 
-    pub(crate) fn terminate(&self, f: impl FnOnce(&mut T)) -> bool {
+    /// Retain the first H3 failure, terminate active transport I/O, and wake a
+    /// task that was pending on that I/O. A normal finish may be upgraded to a
+    /// failure when message validation discovers an error after FIN.
+    pub(crate) fn fail(&self, error: Error, terminate: impl FnOnce(&mut T)) -> bool {
         let mut state = self.0.lock().unwrap();
         let waker = match state.as_mut() {
-            Ok(stream) if !stream.is_finished() => stream.terminate(f),
-            _ => return false,
+            Err(_) => return false,
+            Ok(stream) => match mem::replace(stream, H3Stream::Transition) {
+                H3Stream::Idle(mut io) => {
+                    terminate(&mut io);
+                    None
+                }
+                H3Stream::Polling(mut io, waker) => {
+                    terminate(&mut io);
+                    Some(waker)
+                }
+                H3Stream::Finished => None,
+                H3Stream::Transition => unreachable!(),
+            },
         };
+        *state = Err(error);
         drop(state);
         if let Some(waker) = waker {
             waker.wake();
@@ -128,134 +77,58 @@ impl<T> ArcH3Stream<T> {
         true
     }
 
-    pub(crate) fn goaway(&self, f: impl FnOnce(&mut T)) -> bool {
-        let mut state = self.0.lock().unwrap();
-        let waker = match state.as_mut() {
-            Ok(stream) if !stream.is_finished() => stream.terminate(f),
-            _ => return false,
-        };
-        *state = Err(Goaway);
-        drop(state);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        true
-    }
-
+    /// Complete this direction normally and release its transport I/O.
     pub(crate) fn finish(&self) -> bool {
         let mut state = self.0.lock().unwrap();
-        if let Ok(stream) = state.as_mut()
-            && !stream.is_finished()
-        {
-            stream.finish();
-            return true;
-        }
-        false
-    }
-
-    pub(crate) fn poll_io<O>(
-        &self,
-        cx: &mut Context<'_>,
-        f: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<O>>,
-    ) -> Poll<io::Result<O>>
-    where
-        T: Unpin,
-    {
-        let mut state = self.0.lock().unwrap();
-        match state.as_mut() {
-            Ok(stream) => stream.poll_io(cx, f),
-            Err(Goaway) => Poll::Ready(Err(ErrorCode::RequestRejected
-                .stream("request rejected by GOAWAY")
-                .into())),
+        let Ok(stream) = state.as_mut() else {
+            return false;
+        };
+        match mem::replace(stream, H3Stream::Transition) {
+            H3Stream::Idle(io) | H3Stream::Polling(io, _) => {
+                drop(io);
+                *stream = H3Stream::Finished;
+                true
+            }
+            H3Stream::Finished => {
+                *stream = H3Stream::Finished;
+                false
+            }
+            H3Stream::Transition => unreachable!(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::task::{Context, Poll, Waker};
-
     use super::*;
+    use crate::ErrorCode;
 
     #[test]
-    fn stream_state_transitions_cover_idle_polling_finished_and_goaway() {
-        let idle = ArcH3Stream::new(1);
-        idle.terminate(|io| *io += 1);
-        idle.terminate(|_| panic!("finished I/O is untouched"));
-
-        let rejected = ArcH3Stream::new(2);
-        assert!(rejected.goaway(|io| *io += 1));
-        rejected.terminate(|_| {});
-        assert!(!rejected.goaway(|_| {}));
+    fn stream_state_retains_normal_and_failed_terminal_states() {
+        let failed = ArcH3Stream::new(1);
+        let error = ErrorCode::RequestCancelled.stream("cancelled");
+        assert!(failed.fail(error.clone(), |io| *io += 1));
+        assert!(
+            !failed.fail(ErrorCode::InternalError.stream("later"), |_| panic!(
+                "failed I/O is untouched"
+            ))
+        );
+        assert_eq!(failed.0.lock().unwrap().as_ref().unwrap_err(), &error);
 
         let waker = Waker::noop().clone();
         let polling = ArcH3Stream(Arc::new(Mutex::new(Ok(H3Stream::Polling(3, waker)))));
-        polling.terminate(|io| *io += 1);
+        assert!(polling.fail(error.clone(), |io| *io += 1));
 
-        let idle = ArcH3Stream::new(7);
-        idle.finish();
-        idle.finish();
-    }
-
-    #[test]
-    fn poll_io_retains_retryable_states_and_finishes_terminal_states() {
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
-
-        let state = ArcH3Stream::new(1);
-        assert!(
-            state
-                .poll_io(&mut cx, |_, _| Poll::<io::Result<()>>::Pending)
-                .is_pending()
-        );
+        let finished = ArcH3Stream::new(7);
+        assert!(finished.finish());
+        assert!(!finished.finish());
         assert!(matches!(
-            *state.0.lock().unwrap(),
-            Ok(H3Stream::Polling(_, _))
+            *finished.0.lock().unwrap(),
+            Ok(H3Stream::Finished)
         ));
-        assert!(
-            state
-                .poll_io(&mut cx, |_, _| Poll::Ready(Ok(())))
-                .is_ready()
-        );
-        assert!(matches!(*state.0.lock().unwrap(), Ok(H3Stream::Idle(_))));
-
-        assert!(
-            state
-                .poll_io(&mut cx, |_, _| {
-                    Poll::<io::Result<()>>::Ready(Err(io::Error::from(io::ErrorKind::Interrupted)))
-                })
-                .is_ready()
-        );
-        assert!(matches!(*state.0.lock().unwrap(), Ok(H3Stream::Idle(_))));
-
-        assert!(
-            state
-                .poll_io(&mut cx, |_, _| {
-                    Poll::<io::Result<()>>::Ready(Err(io::Error::other("fatal")))
-                })
-                .is_ready()
-        );
-        assert!(matches!(*state.0.lock().unwrap(), Ok(H3Stream::Idle(_))));
-        state.finish();
-        assert!(
-            state
-                .poll_io(&mut cx, |_, _| Poll::Ready(Ok(())))
-                .is_ready()
-        );
-        assert!(matches!(
-            *state.0.lock().unwrap(),
-            Ok(H3Stream::Finished(_))
-        ));
-
-        let rejected = ArcH3Stream::new(2);
-        rejected.goaway(|_| {});
-        let Poll::Ready(Err(error)) =
-            rejected.poll_io(&mut cx, |_, _| Poll::<io::Result<()>>::Pending)
-        else {
-            panic!("GOAWAY must reject I/O")
-        };
-        let error = crate::Error::from(error);
-        assert_eq!(error.code, ErrorCode::RequestRejected);
-        assert!(matches!(error, crate::Error::Stream(_)));
+        assert!(finished.fail(error.clone(), |_| {
+            panic!("finished I/O has already been released")
+        }));
+        assert_eq!(finished.0.lock().unwrap().as_ref().unwrap_err(), &error);
     }
 }

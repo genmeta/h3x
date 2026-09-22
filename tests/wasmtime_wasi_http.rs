@@ -453,10 +453,11 @@ async fn adapter_body_failure_cancels_output_without_poisoning_connection() {
         )
         .unwrap();
         let mut bytes = Vec::new();
-        // The in-memory transport intentionally has no reset propagation, so
-        // cancellation appears as EOF on this side. The server assertions below
-        // verify that both bridge tasks still terminate with errors.
-        response.read_to_end(&mut bytes).await.unwrap();
+        let error = response.read_to_end(&mut bytes).await.unwrap_err();
+        assert_eq!(
+            h3x::Error::from(error).code,
+            h3x::ErrorCode::RequestCancelled
+        );
         assert_eq!(bytes, b"partial");
 
         let (writer, reader) = client.open_bi().await.unwrap();

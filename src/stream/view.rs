@@ -45,13 +45,7 @@ impl Cursor {
                 }
                 Ok(())
             }
-            Self::Gone(boundary) => {
-                if id < *boundary {
-                    Ok(())
-                } else {
-                    Err(ErrorCode::RequestRejected.stream("request rejected"))
-                }
-            }
+            Self::Gone(_) => Err(ErrorCode::RequestRejected.stream("request rejected")),
         }
     }
 }
@@ -74,7 +68,6 @@ impl StreamView {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn local_not_goaway(&self) -> Result<()> {
         self.local.not_goaway()
     }

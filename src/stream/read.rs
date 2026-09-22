@@ -1,6 +1,6 @@
 use std::{
     future::{Future, poll_fn},
-    io,
+    io, mem,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -8,7 +8,7 @@ use std::{
 use qrecovery::recv::StopSending;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
-use super::{ArcH3Stream, Goaway, StreamEvent, StreamEventHandler};
+use super::{ArcH3Stream, H3Stream, StreamEventHandler};
 use crate::{
     ArcQpack, Error, ErrorCode, TransportError,
     common::{
@@ -36,7 +36,14 @@ impl<R: StopSending> H3ReadStream<R> {
 
     fn finish(&self) {
         if self.state.finish() {
-            (self.handler)(StreamEvent::Finished);
+            (self.handler)(Ok(()));
+        }
+    }
+
+    fn fail(&self, error: Error) {
+        let code = error.code.as_u64();
+        if self.state.fail(error.clone(), |io| io.stop(code)) {
+            (self.handler)(Err(error));
         }
     }
 
@@ -48,8 +55,8 @@ impl<R: StopSending> H3ReadStream<R> {
         let events = self.handler.clone();
         move |error| {
             let code = error.code.as_u64();
-            if state.terminate(|io| io.stop(code)) {
-                events(StreamEvent::Aborted { code });
+            if state.fail(error.clone(), |io| io.stop(code)) {
+                events(Err(error));
             }
         }
     }
@@ -61,9 +68,10 @@ impl<R: StopSending> H3ReadStream<R> {
 
 impl<R: StopSending> StopSending for &H3ReadStream<R> {
     fn stop(&mut self, error_code: u64) {
-        if self.state.terminate(|io| io.stop(error_code)) {
-            (self.handler)(StreamEvent::Aborted { code: error_code });
-        }
+        let error = ErrorCode::try_from(error_code)
+            .unwrap_or(ErrorCode::InternalError)
+            .stream(format!("read stream stopped with code 0x{error_code:x}"));
+        self.fail(error);
     }
 }
 
@@ -84,33 +92,49 @@ impl<R: AsyncRead + StopSending + TransportError + Unpin> AsyncRead for H3ReadSt
             return Poll::Ready(Ok(()));
         }
         let before = buf.filled().len();
-        match self.state.poll_io(cx, |recv, cx| recv.poll_read(cx, buf)) {
-            Poll::Ready(Ok(())) => {
-                if buf.filled().len() == before {
-                    self.finish();
-                }
-                Poll::Ready(Ok(()))
+        let mut state = self.state.0.lock().unwrap();
+        let stream = match state.as_mut() {
+            Err(error) => return Poll::Ready(Err(error.clone().into())),
+            Ok(H3Stream::Finished) => return Poll::Ready(Ok(())),
+            Ok(stream) => stream,
+        };
+        let mut io = match mem::replace(stream, H3Stream::Transition) {
+            H3Stream::Idle(io) | H3Stream::Polling(io, _) => io,
+            H3Stream::Finished | H3Stream::Transition => unreachable!(),
+        };
+        match Pin::new(&mut io).poll_read(cx, buf) {
+            Poll::Pending => {
+                *stream = H3Stream::Polling(io, cx.waker().clone());
+                Poll::Pending
             }
-            Poll::Ready(Err(error)) => {
+            Poll::Ready(Ok(value)) => {
+                if buf.filled().len() == before {
+                    *stream = H3Stream::Finished;
+                    drop(io);
+                    drop(state);
+                    (self.handler)(Ok(()));
+                } else {
+                    *stream = H3Stream::Idle(io);
+                }
+                Poll::Ready(Ok(value))
+            }
+            Poll::Ready(Err(error))
                 if matches!(
                     error.kind(),
                     io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ) {
-                    return Poll::Ready(Err(error));
-                }
+                ) =>
+            {
+                *stream = H3Stream::Idle(io);
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Err(error)) => {
                 let error = R::map_error(error);
-                if self.state.finish() {
-                    if error.is_connection() {
-                        (self.handler)(StreamEvent::Finished);
-                    } else {
-                        (self.handler)(StreamEvent::Aborted {
-                            code: error.code.as_u64(),
-                        });
-                    }
-                }
+                *state = Err(error.clone());
+                drop(io);
+                drop(state);
+                (self.handler)(Err(error.clone()));
                 Poll::Ready(Err(error.into()))
             }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -142,9 +166,7 @@ impl<R: AsyncRead + StopSending + TransportError + Unpin> H3ReadStream<R> {
                 Ok(_) => Poll::Ready(Err(
                     ErrorCode::RequestCancelled.stream("stream is terminated")
                 )),
-                Err(Goaway) => Poll::Ready(Err(
-                    ErrorCode::RequestRejected.stream("request rejected by GOAWAY")
-                )),
+                Err(error) => Poll::Ready(Err(error.clone())),
             }
         })
         .await
@@ -244,7 +266,7 @@ where
             } else {
                 failure.stream()
             };
-            self.stop(failure.code.as_u64());
+            self.fail(failure.clone());
             qpack.error().unwrap_or(failure)
         })?;
         let message_trailers = request.trailers.clone();
@@ -329,7 +351,7 @@ where
             } else {
                 failure.stream()
             };
-            self.stop(failure.code.as_u64());
+            self.fail(failure.clone());
             qpack.error().unwrap_or(failure)
         })?;
 
@@ -483,6 +505,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_poll_preserves_transient_errors_and_reports_terminal_error_once() {
+        struct ScriptedIo(usize);
+
+        impl AsyncRead for ScriptedIo {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                self.0 += 1;
+                match self.0 {
+                    1 => Poll::Pending,
+                    2 => Poll::Ready(Err(io::ErrorKind::Interrupted.into())),
+                    3 => Poll::Ready(Err(io::ErrorKind::WouldBlock.into())),
+                    4 => {
+                        buf.put_slice(b"x");
+                        Poll::Ready(Ok(()))
+                    }
+                    5 => Poll::Ready(Err(ErrorCode::InternalError.connection("fatal").into())),
+                    _ => panic!("failed I/O must not be polled again"),
+                }
+            }
+        }
+
+        impl StopSending for ScriptedIo {
+            fn stop(&mut self, _: u64) {}
+        }
+
+        impl TransportError for ScriptedIo {
+            fn map_error(error: io::Error) -> Error {
+                Error::from_stream_io(error)
+            }
+        }
+
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let captured = reported.clone();
+        let mut stream = H3ReadStream::new(4, ScriptedIo(0), events());
+        let shared = stream.state.clone();
+        stream.handler = Arc::new(move |event| {
+            assert!(shared.0.try_lock().is_ok(), "notify outside the state lock");
+            captured.lock().unwrap().push(event);
+        });
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut bytes = [0; 8];
+        let mut buf = ReadBuf::new(&mut bytes);
+        assert!(
+            Pin::new(&mut stream)
+                .poll_read(&mut cx, &mut buf)
+                .is_pending()
+        );
+        assert!(matches!(
+            *stream.state.0.lock().unwrap(),
+            Ok(H3Stream::Polling(_, _))
+        ));
+        for kind in [io::ErrorKind::Interrupted, io::ErrorKind::WouldBlock] {
+            let Poll::Ready(Err(error)) = Pin::new(&mut stream).poll_read(&mut cx, &mut buf) else {
+                panic!("transient error must be returned");
+            };
+            assert_eq!(error.kind(), kind);
+        }
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), b"x");
+        assert!(reported.lock().unwrap().is_empty());
+        let expected = ErrorCode::InternalError.connection("fatal");
+        for _ in 0..2 {
+            let Poll::Ready(Err(error)) = Pin::new(&mut stream).poll_read(&mut cx, &mut buf) else {
+                panic!("terminal error must be retained");
+            };
+            assert_eq!(Error::from_stream_io(error), expected);
+        }
+        drop(stream);
+        assert_eq!(reported.lock().unwrap().as_slice(), [Err(expected)]);
+    }
+
     fn events() -> StreamEventHandler {
         Arc::new(|_| {})
     }
@@ -502,7 +602,7 @@ mod tests {
             4,
             Io::default(),
             Arc::new(move |event| {
-                if matches!(event, StreamEvent::Aborted { .. }) {
+                if event.is_err() {
                     event_qpack.cancel_decode(vec![4]).unwrap();
                 }
             }),
@@ -615,9 +715,10 @@ mod tests {
     #[tokio::test]
     async fn read_completion_notifies_finish_once() {
         fn reject<R: StopSending>(stream: &H3ReadStream<R>) -> bool {
+            let error = ErrorCode::RequestRejected.stream("request rejected by GOAWAY");
             stream
                 .state
-                .goaway(|io| io.stop(ErrorCode::RequestRejected.as_u64()))
+                .fail(error.clone(), |io| io.stop(error.code.as_u64()))
         }
 
         let completed = Arc::new(AtomicUsize::new(0));
@@ -626,7 +727,7 @@ mod tests {
             0,
             Io::new(b"abc".to_vec()),
             Arc::new(move |event| {
-                if matches!(event, StreamEvent::Finished) {
+                if event.is_ok() {
                     count.fetch_add(1, Ordering::SeqCst);
                 }
             }),
@@ -648,7 +749,7 @@ mod tests {
             4,
             Io::default(),
             Arc::new(move |event| {
-                if matches!(event, StreamEvent::Finished) {
+                if event.is_ok() {
                     count.fetch_add(1, Ordering::SeqCst);
                 }
             }),
@@ -668,7 +769,7 @@ mod tests {
             0,
             Io::default(),
             Arc::new(move |event| {
-                if matches!(event, StreamEvent::Finished) {
+                if event.is_ok() {
                     count.fetch_add(1, Ordering::SeqCst);
                 }
             }),

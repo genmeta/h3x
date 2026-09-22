@@ -94,7 +94,7 @@ impl<T: Transport> H3Connection<T> {
     }
 
     /// Open a bidirectional stream, returning (send, receive).
-    /// Admission stops on peer GOAWAY or connection close, not local GOAWAY.
+    /// Admission stops on local or peer GOAWAY and connection close.
     pub async fn open_bi(
         &self,
     ) -> Result<(
@@ -105,6 +105,7 @@ impl<T: Transport> H3Connection<T> {
         // Pending releases the lock; Ready registers the stream before GOAWAY can run.
         poll_fn(|cx| {
             let mut guard = self.bi_streams.lock().unwrap();
+            guard.local_not_goway()?;
             let (id, (mut recv, mut send)) =
                 ready!(opening.as_mut().poll(cx))?.ok_or_else(|| {
                     ErrorCode::StreamCreationError
@@ -164,8 +165,8 @@ impl<T: Transport> H3Connection<T> {
 
 impl<T: Transport> H3Connection<T> {
     /// Accept and register one peer bidirectional stream, returning (write, read).
-    /// Admission accepts streams below the local GOAWAY boundary and rejects
-    /// streams at or above it; peer GOAWAY does not affect peer-initiated streams.
+    /// Admission stops on local GOAWAY or connection close; peer GOAWAY does not
+    /// affect peer-initiated streams.
     /// The application drives acceptance; no background request queue is maintained.
     pub async fn accept_bi(
         &self,
@@ -176,6 +177,7 @@ impl<T: Transport> H3Connection<T> {
         let mut accepting = pin!(self.transport.accept_bi());
         poll_fn(|cx| {
             let mut guard = self.bi_streams.lock().unwrap();
+            guard.local_not_goway()?;
             let (id, (mut recv, mut send)) = ready!(accepting.as_mut().poll(cx))?;
             let stream_id = qbase::varint::VarInt::try_from(id)
                 .map(qbase::sid::StreamId::from)
@@ -583,24 +585,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_bi_allows_stream_below_local_goaway_boundary() {
-        let accepted = connection(TestTransport::new(
-            None,
+    async fn local_goaway_blocks_opening_and_accepting() {
+        let connection = connection(TestTransport::new(
+            Some((0, (Io::default(), Io::default()))),
             Ok((1, (Io::default(), Io::default()))),
         ));
-        {
-            let mut guard = accepted.bi_streams.lock().unwrap();
-            guard
-                .accept(qbase::sid::StreamId::new(
-                    crate::Role::Server,
-                    qbase::sid::Dir::Bi,
-                    1,
-                ))
-                .unwrap();
-            guard.goaway(accepted.qpack()).unwrap();
-        }
-
-        assert!(accepted.accept_bi().await.is_ok());
+        connection
+            .bi_streams
+            .lock()
+            .unwrap()
+            .goaway(connection.qpack())
+            .unwrap();
+        assert_eq!(
+            connection.accept_bi().await.err().unwrap().code,
+            ErrorCode::RequestRejected
+        );
+        assert_eq!(
+            connection.open_bi().await.err().unwrap().code,
+            ErrorCode::RequestRejected
+        );
     }
 
     #[tokio::test]

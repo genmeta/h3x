@@ -1,9 +1,13 @@
 use std::{
     pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
 };
 
+use futures::task::AtomicWaker;
 use h3x::{Error, ErrorCode, H3Connection, Result, Role, Settings, Transport, TransportError};
 use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::{
@@ -27,7 +31,57 @@ pub struct Connection {
     incoming_uni: Mutex<mpsc::UnboundedReceiver<UniStream>>,
 }
 
-pub struct Stream(DuplexStream);
+#[derive(Default)]
+struct DirectionFailure {
+    error: StdMutex<Option<Error>>,
+    reader: AtomicWaker,
+    writer: AtomicWaker,
+}
+
+impl DirectionFailure {
+    fn fail(&self, code: u64, reason: &'static str) {
+        let error = ErrorCode::try_from(code)
+            .unwrap_or(ErrorCode::InternalError)
+            .stream(reason);
+        let mut stored = self.error.lock().unwrap();
+        if stored.is_none() {
+            *stored = Some(error);
+            drop(stored);
+            self.reader.wake();
+            self.writer.wake();
+        }
+    }
+
+    fn poll_error(&self, cx: &Context<'_>, reader: bool) -> Option<std::io::Error> {
+        let waker = if reader { &self.reader } else { &self.writer };
+        waker.register(cx.waker());
+        self.error.lock().unwrap().clone().map(std::io::Error::from)
+    }
+}
+
+pub struct Stream {
+    io: DuplexStream,
+    recv: Arc<DirectionFailure>,
+    send: Arc<DirectionFailure>,
+}
+
+impl Stream {
+    fn reader(io: DuplexStream, recv: Arc<DirectionFailure>) -> Self {
+        Self {
+            io,
+            recv,
+            send: Arc::default(),
+        }
+    }
+
+    fn writer(io: DuplexStream, send: Arc<DirectionFailure>) -> Self {
+        Self {
+            io,
+            recv: Arc::default(),
+            send,
+        }
+    }
+}
 
 impl AsyncRead for Stream {
     fn poll_read(
@@ -35,7 +89,10 @@ impl AsyncRead for Stream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        if let Some(error) = self.recv.poll_error(cx, true) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.io).poll_read(cx, buf)
     }
 }
 
@@ -45,24 +102,37 @@ impl AsyncWrite for Stream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
+        if let Some(error) = self.send.poll_error(cx, false) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.io).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
+        if let Some(error) = self.send.poll_error(cx, false) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.io).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
+        if let Some(error) = self.send.poll_error(cx, false) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
 
 impl StopSending for Stream {
-    fn stop(&mut self, _: u64) {}
+    fn stop(&mut self, code: u64) {
+        self.recv.fail(code, "peer stopped the stream");
+    }
 }
 
 impl CancelStream for Stream {
-    fn cancel(&mut self, _: u64) {}
+    fn cancel(&mut self, code: u64) {
+        self.send.fail(code, "peer reset the stream");
+    }
 }
 
 impl TransportError for Stream {
@@ -97,10 +167,13 @@ impl Transport for Connection {
     async fn open_uni(&self) -> Result<Option<UniStream>> {
         let id = self.next_uni.fetch_add(4, Ordering::Relaxed);
         let (writer, reader) = duplex(STREAM_CAPACITY);
-        self.outgoing_uni.send((id, Stream(reader))).map_err(|_| {
-            ErrorCode::InternalError.connection("peer stopped accepting unidirectional streams")
-        })?;
-        Ok(Some((id, Stream(writer))))
+        let direction = Arc::new(DirectionFailure::default());
+        self.outgoing_uni
+            .send((id, Stream::reader(reader, direction.clone())))
+            .map_err(|_| {
+                ErrorCode::InternalError.connection("peer stopped accepting unidirectional streams")
+            })?;
+        Ok(Some((id, Stream::writer(writer, direction))))
     }
 
     async fn accept_uni(&self) -> Result<UniStream> {
@@ -149,8 +222,16 @@ pub fn connection_pair() -> (H3Connection<Connection>, H3Connection<Connection>)
 fn bi_stream() -> ((Stream, Stream), (Stream, Stream)) {
     let (local_writer, peer_reader) = duplex(STREAM_CAPACITY);
     let (peer_writer, local_reader) = duplex(STREAM_CAPACITY);
+    let local_to_peer = Arc::new(DirectionFailure::default());
+    let peer_to_local = Arc::new(DirectionFailure::default());
     (
-        (Stream(local_reader), Stream(local_writer)),
-        (Stream(peer_reader), Stream(peer_writer)),
+        (
+            Stream::reader(local_reader, peer_to_local.clone()),
+            Stream::writer(local_writer, local_to_peer.clone()),
+        ),
+        (
+            Stream::reader(peer_reader, local_to_peer),
+            Stream::writer(peer_writer, peer_to_local),
+        ),
     )
 }

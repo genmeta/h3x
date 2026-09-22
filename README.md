@@ -38,9 +38,12 @@ notification; application handles only carry a completion callback and keep
 their own separate I/O waker.
 Explicitly cancelling either direction cancels its peer direction and the
 request's QPACK state.
-Each direction stores `Result<H3Stream, Goaway>`: only GOAWAY rejection is retained
-as an HTTP/3 stream error. Other errors are returned directly by transport
-read, write, flush, or shutdown operations without being cached.
+Each direction stores `Result<H3Stream, Error>`. `H3Stream` contains only active
+I/O and the normal finished state; GOAWAY rejection, cancellation, protocol
+failure, and terminal transport I/O failure are retained as the first H3 error.
+Direction completion is reported as `Result<(), Error>`, so normal and failed
+completion share registry cleanup while failures additionally propagate to the
+paired direction, QPACK, or the connection according to their scope.
 Custom receive/send types must implement `qrecovery::recv::StopSending` and
 `qrecovery::send::CancelStream`, respectively. HTTP/3 calls these explicitly with
 the protocol error code before releasing unfinished directions; it does not rely
@@ -52,9 +55,10 @@ no stored transport dependency. Connection initialization explicitly starts both
 QPACK writers; the connection owns critical-stream failures and transport termination.
 Local encoding errors, including oversized fields, fail only the current operation.
 
-`goaway(self).await` stops accepting peer requests on every clone, writes the
-local GOAWAY, waits for the peer GOAWAY and admitted requests to finish, then
-closes QUIC with `H3_NO_ERROR` and applies the terminal state to H3 waiters.
+`goaway(self).await` stops opening and accepting bidirectional streams on every
+clone, writes the local GOAWAY, waits for the peer GOAWAY and admitted requests
+to finish, then closes QUIC with `H3_NO_ERROR` and applies the terminal state to
+H3 waiters.
 Calling `goaway()` freezes admission immediately. Once frozen, GOAWAY sending continues in
 the control task if the caller is cancelled; await shutdown to finish draining.
 Control and QPACK remain available during draining. On a connection managed directly by the

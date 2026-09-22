@@ -10,7 +10,7 @@ use qbase::varint::VarInt;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use super::*;
-use crate::{Error, ErrorCode, ReadRequest, Settings, TransportError};
+use crate::{Error, ErrorCode, ReadRequest, ReadResponse, Settings, TransportError};
 
 #[derive(Clone, Default)]
 struct Io(Arc<Mutex<Vec<u64>>>);
@@ -97,23 +97,6 @@ fn empty_registry_drains_only_after_local_goaway_and_wakes_waiter() {
 }
 
 #[test]
-fn stream_opened_after_local_goaway_must_still_be_drained() {
-    let streams = Streams::new(Role::Client);
-
-    streams.lock().unwrap().goaway(&qpack()).unwrap();
-
-    // A local stream is still allowed until peer GOAWAY arrives.
-    let _active = insert(&streams, 0);
-
-    streams.lock().unwrap().on_goaway(sid(4), qpack()).unwrap();
-
-    let mut drain = streams.drain();
-    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-
-    assert!(Pin::new(&mut drain).poll(&mut cx).is_pending());
-}
-
-#[test]
 fn cancelling_either_direction_cancels_both_and_completes_drain() {
     for read_first in [true, false] {
         let streams = Streams::new(Role::Server);
@@ -138,8 +121,8 @@ fn cancelling_either_direction_cancels_both_and_completes_drain() {
         assert_eq!(count.0.load(Ordering::SeqCst), 1);
         assert!(Pin::new(&mut drain).poll(&mut cx).is_ready());
         drop((read, write));
-        assert_eq!(recv.codes(), [42]);
-        assert_eq!(send.codes(), [42]);
+        assert_eq!(recv.codes(), [ErrorCode::InternalError.as_u64()]);
+        assert_eq!(send.codes(), [ErrorCode::InternalError.as_u64()]);
     }
 }
 
@@ -187,8 +170,8 @@ fn concurrent_direction_aborts_converge_without_duplicate_transport_cancellation
     assert!(guard.reads.is_empty());
     assert!(guard.writes.is_empty());
     drop(guard);
-    assert_eq!(recv.codes(), [42]);
-    assert_eq!(send.codes(), [42]);
+    assert_eq!(recv.codes(), [ErrorCode::InternalError.as_u64()]);
+    assert_eq!(send.codes(), [ErrorCode::InternalError.as_u64()]);
     assert_eq!(wake_count.0.load(Ordering::SeqCst), 1);
     assert!(Pin::new(&mut drain).poll(&mut cx).is_ready());
     assert!(qpack.lock().unwrap().is_ok());
@@ -349,6 +332,36 @@ struct ResetReader {
     offset: usize,
 }
 
+struct FinReader {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+impl AsyncRead for FinReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let count = (self.bytes.len() - self.offset).min(buf.remaining());
+        if count != 0 {
+            buf.put_slice(&self.bytes[self.offset..self.offset + count]);
+            self.offset += count;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl StopSending for FinReader {
+    fn stop(&mut self, _: u64) {}
+}
+
+impl TransportError for FinReader {
+    fn map_error(error: io::Error) -> Error {
+        Error::from_stream_io(error)
+    }
+}
+
 impl AsyncRead for ResetReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -418,8 +431,76 @@ async fn reset_during_headers_emits_qpack_stream_cancellation() {
     drop(write);
 }
 
+#[tokio::test]
+async fn eof_before_request_headers_cancels_the_response_direction() {
+    let streams = ArcBiStreams::<FinReader, Io>::new(Role::Server);
+    let qpack = qpack();
+    let send = Io::default();
+    let (read, write) = streams.insert(
+        &mut streams.lock().unwrap(),
+        0,
+        FinReader {
+            bytes: Vec::new(),
+            offset: 0,
+        },
+        send.clone(),
+        qpack.clone(),
+    );
+
+    let result: crate::Result<crate::Request<crate::R>> = read.read_request(qpack.clone()).await;
+    let Err(error) = result else {
+        panic!("EOF before request HEADERS must fail the request")
+    };
+    assert_eq!(error.code, ErrorCode::RequestIncomplete);
+    assert_eq!(send.codes(), [ErrorCode::RequestIncomplete.as_u64()]);
+    let guard = streams.lock().unwrap();
+    assert!(guard.reads.is_empty());
+    assert!(guard.writes.is_empty());
+    drop(guard);
+    assert!(qpack.error().is_none());
+    drop(write);
+}
+
+#[tokio::test]
+async fn eof_after_informational_headers_cancels_the_request_direction() {
+    // Literal-only QPACK field section containing `:status: 103`.
+    let mut block = vec![0, 0, 0x27, 0];
+    block.extend_from_slice(b":status");
+    block.extend_from_slice(&[3, b'1', b'0', b'3']);
+    let mut wire = vec![1, block.len() as u8];
+    wire.extend(block);
+
+    let streams = ArcBiStreams::<FinReader, Io>::new(Role::Client);
+    let qpack = qpack();
+    let send = Io::default();
+    let (read, write) = streams.insert(
+        &mut streams.lock().unwrap(),
+        0,
+        FinReader {
+            bytes: wire,
+            offset: 0,
+        },
+        send.clone(),
+        qpack.clone(),
+    );
+
+    let result: crate::Result<crate::Response<crate::R>> =
+        read.read_response(http::Method::GET, qpack.clone()).await;
+    let Err(error) = result else {
+        panic!("EOF before final response HEADERS must fail the request")
+    };
+    assert_eq!(error.code, ErrorCode::RequestIncomplete);
+    assert_eq!(send.codes(), [ErrorCode::RequestIncomplete.as_u64()]);
+    let guard = streams.lock().unwrap();
+    assert!(guard.reads.is_empty());
+    assert!(guard.writes.is_empty());
+    drop(guard);
+    assert!(qpack.error().is_none());
+    drop(write);
+}
+
 #[test]
-fn local_goaway_freezes_acceptance_boundary_and_preserves_admitted_streams() {
+fn local_goaway_freezes_acceptance_and_preserves_registered_streams() {
     for (role, first) in [(Role::Server, 0), (Role::Client, 1)] {
         let streams = Streams::new(role);
         let _admitted = insert(&streams, first + 4);
@@ -438,7 +519,7 @@ fn local_goaway_freezes_acceptance_boundary_and_preserves_admitted_streams() {
             guard.local_not_goway().unwrap_err().code,
             ErrorCode::RequestRejected
         );
-        assert!(guard.accept(sid(first)).is_ok());
+        assert!(guard.accept(sid(first)).is_err());
         assert!(guard.accept(sid(first + 8)).is_err());
         assert!(guard.remote_no_goway().is_ok());
         assert!(guard.reads.contains_key(&(first + 4)));
@@ -471,6 +552,7 @@ fn remote_goaway_blocks_opening_without_starting_local_drain() {
     guard.on_goaway(sid(0), qpack()).unwrap();
     assert!(guard.reads.is_empty());
     assert!(guard.writes.is_empty());
+    drop(guard);
     assert!(Pin::new(&mut drain).poll(&mut cx).is_pending());
 }
 
@@ -486,9 +568,9 @@ fn close_clears_registries_propagates_error_and_completes_drain() {
     guard.close(ErrorCode::InternalError.connection("repeat close"));
     assert!(guard.reads.is_empty());
     assert!(guard.writes.is_empty());
+    drop(guard);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(Pin::new(&mut drain).poll(&mut cx).is_ready());
-    drop(guard);
     for (read, write, recv, send) in handles {
         drop((read, write));
         assert_eq!(recv.codes(), [ErrorCode::InternalError.as_u64()]);

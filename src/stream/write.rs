@@ -1,5 +1,5 @@
 use std::{
-    io,
+    io, mem,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -8,9 +8,9 @@ use bytes::Bytes;
 use qrecovery::send::CancelStream;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::{ArcH3Stream, StreamEvent, StreamEventHandler};
+use super::{ArcH3Stream, H3Stream, StreamEventHandler};
 use crate::{
-    ArcQpack, Error, TransportError,
+    ArcQpack, Error, ErrorCode, TransportError,
     common::{
         request::{Request, WriteRequest},
         response::{Response, WriteResponse},
@@ -37,7 +37,14 @@ impl<W: CancelStream> H3WriteStream<W> {
 
     fn finish(&self) {
         if self.state.finish() {
-            (self.events)(StreamEvent::Finished);
+            (self.events)(Ok(()));
+        }
+    }
+
+    fn fail(&self, error: Error) {
+        let code = error.code.as_u64();
+        if self.state.fail(error.clone(), |io| io.cancel(code)) {
+            (self.events)(Err(error));
         }
     }
 
@@ -49,8 +56,8 @@ impl<W: CancelStream> H3WriteStream<W> {
         let events = self.events.clone();
         move |error| {
             let code = error.code.as_u64();
-            if state.terminate(|io| io.cancel(code)) {
-                events(StreamEvent::Aborted { code });
+            if state.fail(error.clone(), |io| io.cancel(code)) {
+                events(Err(error));
             }
         }
     }
@@ -62,9 +69,10 @@ impl<W: CancelStream> H3WriteStream<W> {
 
 impl<W: CancelStream> CancelStream for &H3WriteStream<W> {
     fn cancel(&mut self, error_code: u64) {
-        if self.state.terminate(|io| io.cancel(error_code)) {
-            (self.events)(StreamEvent::Aborted { code: error_code });
-        }
+        let error = ErrorCode::try_from(error_code)
+            .unwrap_or(ErrorCode::InternalError)
+            .stream(format!("write stream cancelled with code 0x{error_code:x}"));
+        self.fail(error);
     }
 }
 
@@ -74,62 +82,132 @@ impl<W: CancelStream> CancelStream for H3WriteStream<W> {
     }
 }
 
-impl<W: AsyncWrite + CancelStream + TransportError + Unpin> H3WriteStream<W> {
-    fn poll_io<O>(
-        &mut self,
-        cx: &mut Context<'_>,
-        finish: bool,
-        poll: impl FnOnce(Pin<&mut W>, &mut Context<'_>) -> Poll<io::Result<O>>,
-    ) -> Poll<io::Result<O>> {
-        match self.state.poll_io(cx, poll) {
-            Poll::Ready(Ok(value)) => {
-                if finish {
-                    self.finish();
-                }
-                Poll::Ready(Ok(value))
-            }
-            Poll::Ready(Err(error)) => {
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ) {
-                    return Poll::Ready(Err(error));
-                }
-                let error = W::map_error(error);
-                if self.state.finish() {
-                    if error.is_connection() {
-                        (self.events)(StreamEvent::Finished);
-                    } else {
-                        (self.events)(StreamEvent::Aborted {
-                            code: error.code.as_u64(),
-                        });
-                    }
-                }
-                Poll::Ready(Err(error.into()))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 impl<W: AsyncWrite + CancelStream + TransportError + Unpin> AsyncWrite for H3WriteStream<W> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut()
-            .poll_io(cx, false, |send, cx| send.poll_write(cx, buf))
+        let mut state = self.state.0.lock().unwrap();
+        let stream = match state.as_mut() {
+            Err(error) => return Poll::Ready(Err(error.clone().into())),
+            Ok(H3Stream::Finished) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            Ok(stream) => stream,
+        };
+        let mut io = match mem::replace(stream, H3Stream::Transition) {
+            H3Stream::Idle(io) | H3Stream::Polling(io, _) => io,
+            H3Stream::Finished | H3Stream::Transition => unreachable!(),
+        };
+        match Pin::new(&mut io).poll_write(cx, buf) {
+            Poll::Pending => {
+                *stream = H3Stream::Polling(io, cx.waker().clone());
+                Poll::Pending
+            }
+            Poll::Ready(Ok(value)) => {
+                *stream = H3Stream::Idle(io);
+                Poll::Ready(Ok(value))
+            }
+            Poll::Ready(Err(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                *stream = H3Stream::Idle(io);
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Err(error)) => {
+                let error = W::map_error(error);
+                *state = Err(error.clone());
+                drop(io);
+                drop(state);
+                (self.events)(Err(error.clone()));
+                Poll::Ready(Err(error.into()))
+            }
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut()
-            .poll_io(cx, false, |send, cx| send.poll_flush(cx))
+        let mut state = self.state.0.lock().unwrap();
+        let stream = match state.as_mut() {
+            Err(error) => return Poll::Ready(Err(error.clone().into())),
+            Ok(H3Stream::Finished) => return Poll::Ready(Ok(())),
+            Ok(stream) => stream,
+        };
+        let mut io = match mem::replace(stream, H3Stream::Transition) {
+            H3Stream::Idle(io) | H3Stream::Polling(io, _) => io,
+            H3Stream::Finished | H3Stream::Transition => unreachable!(),
+        };
+        match Pin::new(&mut io).poll_flush(cx) {
+            Poll::Pending => {
+                *stream = H3Stream::Polling(io, cx.waker().clone());
+                Poll::Pending
+            }
+            Poll::Ready(Ok(value)) => {
+                *stream = H3Stream::Idle(io);
+                Poll::Ready(Ok(value))
+            }
+            Poll::Ready(Err(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                *stream = H3Stream::Idle(io);
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Err(error)) => {
+                let error = W::map_error(error);
+                *state = Err(error.clone());
+                drop(io);
+                drop(state);
+                (self.events)(Err(error.clone()));
+                Poll::Ready(Err(error.into()))
+            }
+        }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut()
-            .poll_io(cx, true, |send, cx| send.poll_shutdown(cx))
+        let mut state = self.state.0.lock().unwrap();
+        let stream = match state.as_mut() {
+            Err(error) => return Poll::Ready(Err(error.clone().into())),
+            Ok(H3Stream::Finished) => return Poll::Ready(Ok(())),
+            Ok(stream) => stream,
+        };
+        let mut io = match mem::replace(stream, H3Stream::Transition) {
+            H3Stream::Idle(io) | H3Stream::Polling(io, _) => io,
+            H3Stream::Finished | H3Stream::Transition => unreachable!(),
+        };
+        match Pin::new(&mut io).poll_shutdown(cx) {
+            Poll::Pending => {
+                *stream = H3Stream::Polling(io, cx.waker().clone());
+                Poll::Pending
+            }
+            Poll::Ready(Ok(value)) => {
+                *stream = H3Stream::Finished;
+                drop(io);
+                drop(state);
+                (self.events)(Ok(()));
+                Poll::Ready(Ok(value))
+            }
+            Poll::Ready(Err(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                *stream = H3Stream::Idle(io);
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Err(error)) => {
+                let error = W::map_error(error);
+                *state = Err(error.clone());
+                drop(io);
+                drop(state);
+                (self.events)(Err(error.clone()));
+                Poll::Ready(Err(error.into()))
+            }
+        }
     }
 }
 
@@ -208,7 +286,7 @@ where
             } else {
                 failure.stream()
             };
-            self.cancel(failure.code.as_u64());
+            self.fail(failure.clone());
             producer.error(failure.clone());
             qpack.error().unwrap_or(failure)
         })
@@ -298,7 +376,7 @@ where
             } else {
                 failure.stream()
             };
-            self.cancel(failure.code.as_u64());
+            self.fail(failure.clone());
             producer.error(failure.clone());
             qpack.error().unwrap_or(failure)
         })
@@ -396,28 +474,30 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_write_errors_report_their_scope() {
-        for (error, expected) in [
-            (
-                ErrorCode::RequestCancelled.stream("stream stopped"),
-                StreamEvent::Aborted {
-                    code: ErrorCode::RequestCancelled.as_u64(),
-                },
-            ),
-            (
-                ErrorCode::InternalError.connection("connection failed"),
-                StreamEvent::Finished,
-            ),
+        for error in [
+            ErrorCode::RequestCancelled.stream("stream stopped"),
+            ErrorCode::InternalError.connection("connection failed"),
         ] {
-            let reported = Arc::new(Mutex::new(Vec::new()));
-            let captured = reported.clone();
-            let mut stream = H3WriteStream::new(
-                4,
-                FailingIo(error.clone()),
-                Arc::new(move |event| captured.lock().unwrap().push(event)),
-            );
-            let returned = Error::from_stream_io(stream.write_all(b"x").await.unwrap_err());
-            assert_eq!(returned, error);
-            assert_eq!(reported.lock().unwrap().as_slice(), [expected]);
+            for operation in 0..3 {
+                let reported = Arc::new(Mutex::new(Vec::new()));
+                let captured = reported.clone();
+                let mut stream = H3WriteStream::new(4, FailingIo(error.clone()), events());
+                let shared = stream.state.clone();
+                stream.events = Arc::new(move |event| {
+                    assert!(shared.0.try_lock().is_ok(), "notify outside the state lock");
+                    captured.lock().unwrap().push(event);
+                });
+                for _ in 0..2 {
+                    let result = match operation {
+                        0 => stream.write_all(b"x").await,
+                        1 => stream.flush().await,
+                        _ => stream.shutdown().await,
+                    };
+                    assert_eq!(Error::from_stream_io(result.unwrap_err()), error);
+                }
+                drop(stream);
+                assert_eq!(reported.lock().unwrap().as_slice(), [Err(error.clone())]);
+            }
         }
     }
 
@@ -433,7 +513,7 @@ mod tests {
             4,
             io,
             Arc::new(move |event| {
-                if matches!(event, StreamEvent::Finished) {
+                if event.is_ok() {
                     count.fetch_add(1, Ordering::SeqCst);
                 }
             }),
@@ -443,6 +523,12 @@ mod tests {
         stream.write_all(b"hello").await.unwrap();
         stream.flush().await.unwrap();
         AsyncWriteExt::shutdown(&mut stream).await.unwrap();
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+        assert_eq!(
+            stream.write(b"x").await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
         assert_eq!(&*bytes.lock().unwrap(), b"hello");
         assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
         assert_eq!(completed.load(Ordering::SeqCst), 1);
@@ -454,9 +540,10 @@ mod tests {
     #[tokio::test]
     async fn reject_and_explicit_cancel_report_expected_codes() {
         fn reject<W: CancelStream>(stream: &H3WriteStream<W>) -> bool {
+            let error = ErrorCode::RequestRejected.stream("request rejected by GOAWAY");
             stream
                 .state
-                .goaway(|io| io.cancel(ErrorCode::RequestRejected.as_u64()))
+                .fail(error.clone(), |io| io.cancel(error.code.as_u64()))
         }
 
         let io = Io::default();
@@ -481,16 +568,21 @@ mod tests {
             12,
             io,
             Arc::new(move |event| {
-                if matches!(event, StreamEvent::Finished | StreamEvent::Aborted { .. }) {
-                    count.fetch_add(1, Ordering::SeqCst);
-                }
+                let _ = event;
+                count.fetch_add(1, Ordering::SeqCst);
             }),
         );
         (&stream).cancel(9);
-        assert_eq!(&*cancels.lock().unwrap(), &[9]);
+        assert_eq!(
+            &*cancels.lock().unwrap(),
+            &[ErrorCode::InternalError.as_u64()]
+        );
         assert_eq!(completed.load(Ordering::SeqCst), 1);
         (&stream).cancel(10);
-        assert_eq!(&*cancels.lock().unwrap(), &[9]);
+        assert_eq!(
+            &*cancels.lock().unwrap(),
+            &[ErrorCode::InternalError.as_u64()]
+        );
     }
 
     #[tokio::test]
@@ -512,7 +604,7 @@ mod tests {
             0,
             request_io,
             Arc::new(move |event| {
-                if matches!(event, StreamEvent::Finished) {
+                if event.is_ok() {
                     assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
                     completed.fetch_add(1, Ordering::SeqCst);
                 }
@@ -537,7 +629,7 @@ mod tests {
             0,
             response_io,
             Arc::new(move |event| {
-                if matches!(event, StreamEvent::Finished) {
+                if event.is_ok() {
                     assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
                     completed.fetch_add(1, Ordering::SeqCst);
                 }
