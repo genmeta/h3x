@@ -2,6 +2,8 @@
 
 use std::{
     future::poll_fn,
+    io,
+    pin::Pin,
     sync::{Arc, Mutex},
     task::Poll,
 };
@@ -192,7 +194,7 @@ impl ArcQpack {
     /// Error scope is selected by the caller from the context in which the
     /// error occurred; an HTTP/3 error code alone does not determine it.
     pub fn on_stream_error(&self, id: u64, error: Error) -> Error {
-        if let Err(cancel_error) = self.cancel_decode(id) {
+        if let Err(cancel_error) = self.cancel_decode(vec![id]) {
             return self.on_connection_error(cancel_error);
         }
         error.stream()
@@ -263,8 +265,8 @@ impl ArcQpack {
         .await
     }
 
-    pub fn cancel_decode(&self, id: u64) -> Result<()> {
-        let wakes = self.with_state(|state| state.decoder.cancel(id))?;
+    pub fn cancel_decode(&self, ids: Vec<u64>) -> Result<()> {
+        let wakes = self.with_state(|state| state.decoder.cancel(ids))?;
         for wake in wakes {
             wake.wake();
         }
@@ -309,18 +311,56 @@ impl ArcQpack {
             for instruction in batch {
                 buf.clear();
                 buf.put_encoder_instruction(&instruction)?;
-                writer.write_all(&buf).await.map_err(|error| {
-                    crate::Error::from_io(error, ErrorCode::ClosedCriticalStream)
-                })?;
-                if !matches!(instruction, EncoderInstruction::SetDynamicTableCapacity(_)) {
-                    self.with_state(|state| {
-                        state.encoder.record_insert_written();
-                        Ok(())
+                if matches!(instruction, EncoderInstruction::SetDynamicTableCapacity(_)) {
+                    writer.write_all(&buf).await.map_err(|error| {
+                        crate::Error::from_io(error, ErrorCode::ClosedCriticalStream)
                     })?;
+                } else {
+                    self.write_insert(writer, &buf).await?;
                 }
             }
         }
         Err(self.critical_stream_error())
+    }
+
+    /// Make the final bytes of an insertion and its completion count visible in
+    /// the same order to decoder feedback. The lock is released whenever the
+    /// transport cannot accept more bytes immediately.
+    async fn write_insert<W: AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let mut offset = 0;
+        poll_fn(|cx| {
+            let mut shared = self.lock().unwrap();
+            let state = match &mut *shared {
+                Ok(state) => state,
+                Err(error) => return Poll::Ready(Err(error.clone())),
+            };
+            match Pin::new(&mut *writer).poll_write(cx, &bytes[offset..]) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(error)) => Poll::Ready(Err(crate::Error::from_io(
+                    error,
+                    ErrorCode::ClosedCriticalStream,
+                ))),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(crate::Error::from_io(
+                    io::ErrorKind::WriteZero.into(),
+                    ErrorCode::ClosedCriticalStream,
+                ))),
+                Poll::Ready(Ok(written)) => {
+                    offset += written;
+                    if offset == bytes.len() {
+                        state.encoder.record_insert_written();
+                        Poll::Ready(Ok(()))
+                    } else {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                }
+            }
+        })
+        .await
     }
 
     pub(crate) async fn write_decoder<W: AsyncWrite + Unpin>(
@@ -391,8 +431,13 @@ pub(crate) mod tests {
     use std::{
         io,
         pin::Pin,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            TryLockError,
+            atomic::{AtomicUsize, Ordering},
+            mpsc as std_mpsc,
+        },
         task::{Context, Poll},
+        thread,
     };
 
     use codec::instruction::DecoderInstruction;
@@ -414,6 +459,12 @@ pub(crate) mod tests {
 
     struct FailingWriter;
 
+    struct FeedbackInterleavingWriter {
+        writes: usize,
+        insertion_visible: Option<std_mpsc::Sender<()>>,
+        feedback_saw_lock: std_mpsc::Receiver<bool>,
+    }
+
     impl AsyncWrite for FailingWriter {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -429,6 +480,32 @@ pub(crate) mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Err(io::Error::other("shutdown failed")))
+        }
+    }
+
+    impl AsyncWrite for FeedbackInterleavingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            if self.writes == 3 {
+                self.insertion_visible.take().unwrap().send(()).unwrap();
+                assert!(
+                    self.feedback_saw_lock.recv().unwrap(),
+                    "QPACK feedback could acquire the state lock before the insertion was recorded"
+                );
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -681,6 +758,83 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn insertion_write_and_completion_are_ordered_before_decoder_feedback() {
+        let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
+        let queued = Arc::new(Mutex::new(Vec::new()));
+        let captured = queued.clone();
+        qpack
+            .with_state(|state| {
+                state.encoder.on_instruction(move |batch| {
+                    captured.lock().unwrap().push(batch);
+                    Ok(())
+                });
+                Ok(())
+            })
+            .unwrap();
+        qpack
+            .configure(
+                Settings {
+                    max_table_capacity: 128,
+                    blocked_streams: 1,
+                },
+                4096,
+            )
+            .unwrap();
+        qpack
+            .encode(0, vec![field(b"x-interleaved", b"value", false)])
+            .unwrap();
+
+        let (instruction_tx, instruction_rx) = tokio::sync::mpsc::channel(2);
+        let batches = std::mem::take(&mut *queued.lock().unwrap());
+        assert_eq!(batches.len(), 2);
+        for batch in batches {
+            instruction_tx.send(batch).await.unwrap();
+        }
+        drop(instruction_tx);
+
+        let (visible_tx, visible_rx) = std_mpsc::channel();
+        let (lock_tx, lock_rx) = std_mpsc::channel();
+        let feedback_qpack = qpack.clone();
+        let feedback = thread::spawn(move || {
+            visible_rx.recv().unwrap();
+            let apply = |state: &mut Qpack| {
+                state
+                    .encoder
+                    .on_decoder_instruction(DecoderInstruction::InsertCountIncrement(1))?;
+                state
+                    .encoder
+                    .on_decoder_instruction(DecoderInstruction::SectionAcknowledgment(0))
+            };
+            match feedback_qpack.try_lock() {
+                Ok(mut shared) => {
+                    lock_tx.send(false).unwrap();
+                    apply(shared.as_mut().unwrap())
+                }
+                Err(TryLockError::WouldBlock) => {
+                    lock_tx.send(true).unwrap();
+                    feedback_qpack.with_state(apply)
+                }
+                Err(TryLockError::Poisoned(_)) => panic!("QPACK state lock was poisoned"),
+            }
+        });
+        let mut writer = FeedbackInterleavingWriter {
+            writes: 0,
+            insertion_visible: Some(visible_tx),
+            feedback_saw_lock: lock_rx,
+        };
+
+        assert_eq!(
+            qpack
+                .write_encoder(instruction_rx, &mut writer)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::ClosedCriticalStream
+        );
+        feedback.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn instruction_receivers_apply_valid_input_then_map_eof() {
         let settings = super::super::connection::Settings::new(4096, 128, 1).unwrap();
         let qpack = ArcQpack::new(&settings).unwrap();
@@ -830,7 +984,7 @@ pub(crate) mod tests {
             tokio::spawn(async move { qpack.decode(4, wire.into()).await })
         };
         tokio::task::yield_now().await;
-        qpack.cancel_decode(4).unwrap();
+        qpack.cancel_decode(vec![4]).unwrap();
         assert_eq!(
             decoding.await.unwrap().unwrap_err().code,
             ErrorCode::RequestCancelled

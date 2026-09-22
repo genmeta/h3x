@@ -73,7 +73,7 @@ impl<R: StopSending> StopSending for H3ReadStream<R> {
     }
 }
 
-impl<R: AsyncRead + StopSending + Unpin> AsyncRead for H3ReadStream<R> {
+impl<R: AsyncRead + StopSending + TransportError + Unpin> AsyncRead for H3ReadStream<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -84,13 +84,34 @@ impl<R: AsyncRead + StopSending + Unpin> AsyncRead for H3ReadStream<R> {
             return Poll::Ready(Ok(()));
         }
         let before = buf.filled().len();
-        let result = self.state.poll_io(cx, |recv, cx| recv.poll_read(cx, buf));
-        let eof = matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() == before;
-        let failed = matches!(&result, Poll::Ready(Err(error)) if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock));
-        if eof || failed {
-            self.finish();
+        match self.state.poll_io(cx, |recv, cx| recv.poll_read(cx, buf)) {
+            Poll::Ready(Ok(())) => {
+                if buf.filled().len() == before {
+                    self.finish();
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) {
+                    return Poll::Ready(Err(error));
+                }
+                let error = R::map_error(error);
+                if self.state.finish() {
+                    if error.is_connection() {
+                        (self.handler)(StreamEvent::Finished);
+                    } else {
+                        (self.handler)(StreamEvent::Aborted {
+                            code: error.code.as_u64(),
+                        });
+                    }
+                }
+                Poll::Ready(Err(error.into()))
+            }
+            Poll::Pending => Poll::Pending,
         }
-        result
     }
 }
 
@@ -482,7 +503,7 @@ mod tests {
             Io::default(),
             Arc::new(move |event| {
                 if matches!(event, StreamEvent::Aborted { .. }) {
-                    event_qpack.cancel_decode(4).unwrap();
+                    event_qpack.cancel_decode(vec![4]).unwrap();
                 }
             }),
         ));

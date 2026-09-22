@@ -81,15 +81,15 @@ impl Decoder {
         result
     }
 
-    pub(super) fn cancel(&mut self, id: u64) -> Result<Vec<Waker>> {
-        self.state.cancel_stream(id)
+    pub(super) fn cancel(&mut self, ids: Vec<u64>) -> Result<Vec<Waker>> {
+        self.state.cancel_stream(ids)
     }
 
     pub(super) fn cancel_registered(&mut self, id: u64) -> Result<Vec<Waker>> {
         if !self.state.decoding_stream.remove(&id) {
             return Ok(Vec::new());
         }
-        self.state.cancel_stream(id)
+        self.state.cancel_stream(vec![id])
     }
 
     pub(super) fn on_encoder_instruction(
@@ -197,7 +197,13 @@ mod state {
             }
 
             // Admit a newly blocked section within the advertised and local budgets.
-            if self.waiting.len() as u64 >= self.max_blocked_streams {
+            let insert_count = self.table.insert_count();
+            let blocked = self
+                .waiting
+                .values()
+                .filter(|(required, _, _)| *required > insert_count)
+                .count();
+            if blocked as u64 >= self.max_blocked_streams {
                 return Poll::Ready(Err(ErrorCode::QpackDecompressionFailed
                     .connection("peer exceeded the advertised QPACK blocked-stream limit")));
             }
@@ -232,7 +238,7 @@ mod state {
             if increment != 0 {
                 // Queue progress before any ACK that can reference these insertions.
                 // All producers hold the decoder state lock, preserving this wire order.
-                self.send_feedback(DecoderInstruction::InsertCountIncrement(increment))?;
+                self.send_feedback(vec![DecoderInstruction::InsertCountIncrement(increment)])?;
             }
             let wakes = self
                 .waiting
@@ -249,19 +255,26 @@ mod state {
             }
         }
 
-        pub(super) fn cancel_stream(&mut self, id: u64) -> Result<Vec<Waker>> {
-            if id > VARINT_MAX {
+        pub(super) fn cancel_stream(&mut self, ids: Vec<u64>) -> Result<Vec<Waker>> {
+            if ids.iter().any(|id| *id > VARINT_MAX) {
                 return Err(ErrorCode::InternalError
                     .connection("cancelled stream ID exceeds the QUIC variable-integer range"));
             }
-            if self.table.max_capacity() != 0 {
-                self.send_feedback(DecoderInstruction::StreamCancellation(id))?;
+            if self.table.max_capacity() != 0 && !ids.is_empty() {
+                self.send_feedback(
+                    ids.iter()
+                        .copied()
+                        .map(DecoderInstruction::StreamCancellation)
+                        .collect(),
+                )?;
             }
-            self.decoding_stream.remove(&id);
             let mut wakes = Vec::new();
-            if let Some((_, bytes, waker)) = self.waiting.remove(&id) {
-                self.blocked_bytes -= bytes;
-                wakes.push(waker);
+            for id in ids {
+                self.decoding_stream.remove(&id);
+                if let Some((_, bytes, waker)) = self.waiting.remove(&id) {
+                    self.blocked_bytes -= bytes;
+                    wakes.push(waker);
+                }
             }
             Ok(wakes)
         }
@@ -275,7 +288,7 @@ mod state {
 
         fn acknowledge(&self, stream_id: u64, required_insert_count: u64) -> Result<()> {
             if required_insert_count != 0 {
-                self.send_feedback(DecoderInstruction::SectionAcknowledgment(stream_id))?;
+                self.send_feedback(vec![DecoderInstruction::SectionAcknowledgment(stream_id)])?;
             }
             Ok(())
         }
@@ -283,9 +296,8 @@ mod state {
         /// Feedback is required for QPACK correctness, so overload fails the
         /// connection instead of dropping an instruction or blocking under the
         /// decoder state lock.
-        fn send_feedback(&self, instruction: DecoderInstruction) -> Result<()> {
-            // Each current decoder operation produces at most one feedback instruction.
-            (self.on_instruction)(vec![instruction])
+        fn send_feedback(&self, instructions: super::Batch) -> Result<()> {
+            (self.on_instruction)(instructions)
         }
 
         /// Shared by immediate and resumed decoding: reject evicted/out-of-range references,
@@ -426,6 +438,37 @@ mod tests {
     }
 
     #[test]
+    fn unblocked_unpolled_decode_does_not_consume_blocked_stream_slot() {
+        let (mut decoder, _) = make_decoder(1, 1024, 1024);
+        let first = dynamic_wire(1, FieldLine::IndexedPostBase { index: 0 });
+        let (first_offset, first_prefix) = decoder.begin_decode(0, &first).unwrap();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(
+            decoder
+                .poll_registered_decode(0, first_prefix, &first[first_offset..], &mut cx)
+                .is_pending()
+        );
+
+        let wakes = decoder
+            .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {
+                name: Bytes::from_static(b"x-first"),
+                value: Bytes::from_static(b"value"),
+            })
+            .unwrap();
+        assert_eq!(wakes.len(), 1);
+
+        // Do not repoll stream 0. Its waiter is retained, but RIC=1 is now satisfied.
+        let second = dynamic_wire(2, FieldLine::IndexedPostBase { index: 0 });
+        let (second_offset, second_prefix) = decoder.begin_decode(4, &second).unwrap();
+        assert!(
+            decoder
+                .poll_registered_decode(4, second_prefix, &second[second_offset..], &mut cx)
+                .is_pending()
+        );
+    }
+
+    #[test]
     fn cancellation_and_blocking_budgets_clean_up_waiters() {
         let wire = dynamic_wire(1, FieldLine::IndexedPostBase { index: 0 });
         let waker = Waker::noop();
@@ -451,7 +494,7 @@ mod tests {
                 .is_ready()
         );
         assert_eq!(
-            decoder.cancel(VARINT_MAX + 1).unwrap_err().code,
+            decoder.cancel(vec![VARINT_MAX + 1]).unwrap_err().code,
             ErrorCode::InternalError
         );
 

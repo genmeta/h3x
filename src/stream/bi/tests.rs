@@ -1,10 +1,16 @@
-use std::sync::{Barrier, atomic::AtomicUsize};
+use std::{
+    io,
+    pin::Pin,
+    sync::{Barrier, atomic::AtomicUsize},
+    task::{Context, Poll},
+};
 
 use futures::task::{ArcWake, waker};
 use qbase::varint::VarInt;
+use tokio::io::{AsyncRead, ReadBuf};
 
 use super::*;
-use crate::{ErrorCode, Settings};
+use crate::{Error, ErrorCode, ReadRequest, Settings, TransportError};
 
 #[derive(Clone, Default)]
 struct Io(Arc<Mutex<Vec<u64>>>);
@@ -189,8 +195,8 @@ fn concurrent_direction_aborts_converge_without_duplicate_transport_cancellation
 
     // Repeated stream-cancellation feedback remains non-fatal.
     let feedback_before_duplicates = feedback.load(Ordering::SeqCst);
-    qpack.cancel_decode(0).unwrap();
-    qpack.cancel_decode(0).unwrap();
+    qpack.cancel_decode(vec![0]).unwrap();
+    qpack.cancel_decode(vec![0]).unwrap();
     assert_eq!(
         feedback.load(Ordering::SeqCst),
         feedback_before_duplicates + 2
@@ -286,6 +292,130 @@ fn rejection_is_inclusive_directional_sorted_and_deduplicated() {
         assert_eq!(recv.codes(), expected);
         assert_eq!(send.codes(), expected);
     }
+}
+
+#[test]
+fn goaway_batches_more_cancellations_than_the_feedback_queue_capacity() {
+    let streams = Streams::new(Role::Client);
+    let qpack = ArcQpack::new(&Settings::default()).unwrap();
+    let (feedback_tx, mut feedback_rx) =
+        tokio::sync::mpsc::channel(crate::qpack::MAX_PENDING_INSTRUCTION);
+    qpack
+        .with_state(|state| {
+            state.decoder.on_instruction(move |batch| {
+                feedback_tx
+                    .try_send(batch)
+                    .map_err(crate::qpack::instruction_send_error)
+            });
+            Ok(())
+        })
+        .unwrap();
+
+    let handles = (0..=17)
+        .map(|index| {
+            let id = index * 4;
+            (id, insert_with_qpack(&streams, id, qpack.clone()))
+        })
+        .collect::<Vec<_>>();
+
+    let mut guard = streams.lock().unwrap();
+    guard.on_goaway(sid(4), qpack.clone()).unwrap();
+    assert!(guard.reads.contains_key(&0));
+    assert!(guard.writes.contains_key(&0));
+    assert_eq!(guard.reads.len(), 1);
+    assert_eq!(guard.writes.len(), 1);
+    drop(guard);
+
+    let batch = feedback_rx.try_recv().unwrap();
+    assert_eq!(batch.len(), 17);
+    let mut cancellations = batch
+        .iter()
+        .map(|instruction| format!("{instruction:?}"))
+        .collect::<Vec<_>>();
+    cancellations.sort();
+    let mut expected = (1..=17)
+        .map(|index| format!("StreamCancellation({})", index * 4))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(cancellations, expected);
+    assert!(feedback_rx.try_recv().is_err());
+    assert!(qpack.error().is_none());
+    assert!(handles[0].1.2.codes().is_empty());
+    assert!(handles[0].1.3.codes().is_empty());
+}
+
+struct ResetReader {
+    bytes: &'static [u8],
+    offset: usize,
+}
+
+impl AsyncRead for ResetReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.offset == self.bytes.len() {
+            return Poll::Ready(Err(io::Error::other("peer reset the stream")));
+        }
+        let count = (self.bytes.len() - self.offset).min(buf.remaining());
+        buf.put_slice(&self.bytes[self.offset..self.offset + count]);
+        self.offset += count;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl StopSending for ResetReader {
+    fn stop(&mut self, _: u64) {}
+}
+
+impl TransportError for ResetReader {
+    fn map_error(_: io::Error) -> Error {
+        ErrorCode::RequestCancelled.stream("peer reset the stream")
+    }
+}
+
+#[tokio::test]
+async fn reset_during_headers_emits_qpack_stream_cancellation() {
+    let streams = ArcBiStreams::<ResetReader, Io>::new(Role::Server);
+    let qpack = ArcQpack::new(&Settings::default()).unwrap();
+    let feedback = Arc::new(Mutex::new(Vec::new()));
+    let captured = feedback.clone();
+    qpack
+        .with_state(|state| {
+            state.decoder.on_instruction(move |batch| {
+                captured.lock().unwrap().push(format!("{batch:?}"));
+                Ok(())
+            });
+            Ok(())
+        })
+        .unwrap();
+    let send = Io::default();
+    let (read, write) = streams.insert(
+        &mut streams.lock().unwrap(),
+        0,
+        // HEADERS length is 3, but only one payload byte arrives before RESET.
+        ResetReader {
+            bytes: &[0x01, 0x03, 0x00],
+            offset: 0,
+        },
+        send.clone(),
+        qpack.clone(),
+    );
+
+    let result: crate::Result<crate::Request<crate::R>> = read.read_request(qpack).await;
+    let Err(error) = result else {
+        panic!("RESET during HEADERS must fail the request")
+    };
+    assert_eq!(error.code, ErrorCode::RequestCancelled);
+    assert_eq!(
+        feedback.lock().unwrap().as_slice(),
+        ["[StreamCancellation(0)]"]
+    );
+    assert_eq!(send.codes(), [ErrorCode::RequestCancelled.as_u64()]);
+    assert!(streams.lock().unwrap().reads.is_empty());
+    assert!(streams.lock().unwrap().writes.is_empty());
+    drop(write);
 }
 
 #[test]

@@ -86,9 +86,7 @@ impl<R: StopSending, W: CancelStream> BiStreams<R, W> {
                 rejected.insert(id);
             }
         }
-        for id in rejected {
-            qpack.cancel_decode(id)?;
-        }
+        qpack.cancel_decode(rejected.into_iter().collect())?;
         self.try_wake();
         Ok(())
     }
@@ -231,7 +229,7 @@ where
         {
             streams.lock().unwrap().remove_write(id);
         }
-        if let Err(error) = qpack.cancel_decode(id) {
+        if let Err(error) = qpack.cancel_decode(vec![id]) {
             qpack.on_connection_error(error);
         }
     }
@@ -249,7 +247,7 @@ where
             streams.lock().unwrap().remove_read(id);
         }
         if code != ErrorCode::NoError.as_u64()
-            && let Err(error) = qpack.cancel_decode(id)
+            && let Err(error) = qpack.cancel_decode(vec![id])
         {
             qpack.on_connection_error(error);
         }

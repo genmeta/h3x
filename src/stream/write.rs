@@ -74,24 +74,45 @@ impl<W: CancelStream> CancelStream for H3WriteStream<W> {
     }
 }
 
-impl<W: AsyncWrite + CancelStream + Unpin> H3WriteStream<W> {
+impl<W: AsyncWrite + CancelStream + TransportError + Unpin> H3WriteStream<W> {
     fn poll_io<O>(
         &mut self,
         cx: &mut Context<'_>,
         finish: bool,
         poll: impl FnOnce(Pin<&mut W>, &mut Context<'_>) -> Poll<io::Result<O>>,
     ) -> Poll<io::Result<O>> {
-        let result = self.state.poll_io(cx, poll);
-        let completed = finish && matches!(result, Poll::Ready(Ok(_)));
-        let failed = matches!(&result, Poll::Ready(Err(error)) if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock));
-        if completed || failed {
-            self.finish();
+        match self.state.poll_io(cx, poll) {
+            Poll::Ready(Ok(value)) => {
+                if finish {
+                    self.finish();
+                }
+                Poll::Ready(Ok(value))
+            }
+            Poll::Ready(Err(error)) => {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) {
+                    return Poll::Ready(Err(error));
+                }
+                let error = W::map_error(error);
+                if self.state.finish() {
+                    if error.is_connection() {
+                        (self.events)(StreamEvent::Finished);
+                    } else {
+                        (self.events)(StreamEvent::Aborted {
+                            code: error.code.as_u64(),
+                        });
+                    }
+                }
+                Poll::Ready(Err(error.into()))
+            }
+            Poll::Pending => Poll::Pending,
         }
-        result
     }
 }
 
-impl<W: AsyncWrite + CancelStream + Unpin> AsyncWrite for H3WriteStream<W> {
+impl<W: AsyncWrite + CancelStream + TransportError + Unpin> AsyncWrite for H3WriteStream<W> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -341,6 +362,63 @@ mod tests {
 
     fn events() -> StreamEventHandler {
         Arc::new(|_| {})
+    }
+
+    struct FailingIo(Error);
+
+    impl AsyncWrite for FailingIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(self.0.clone().into()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(self.0.clone().into()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(self.0.clone().into()))
+        }
+    }
+
+    impl CancelStream for FailingIo {
+        fn cancel(&mut self, _: u64) {}
+    }
+
+    impl TransportError for FailingIo {
+        fn map_error(error: io::Error) -> Error {
+            Error::from_stream_io(error)
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_write_errors_report_their_scope() {
+        for (error, expected) in [
+            (
+                ErrorCode::RequestCancelled.stream("stream stopped"),
+                StreamEvent::Aborted {
+                    code: ErrorCode::RequestCancelled.as_u64(),
+                },
+            ),
+            (
+                ErrorCode::InternalError.connection("connection failed"),
+                StreamEvent::Finished,
+            ),
+        ] {
+            let reported = Arc::new(Mutex::new(Vec::new()));
+            let captured = reported.clone();
+            let mut stream = H3WriteStream::new(
+                4,
+                FailingIo(error.clone()),
+                Arc::new(move |event| captured.lock().unwrap().push(event)),
+            );
+            let returned = Error::from_stream_io(stream.write_all(b"x").await.unwrap_err());
+            assert_eq!(returned, error);
+            assert_eq!(reported.lock().unwrap().as_slice(), [expected]);
+        }
     }
 
     #[tokio::test]
