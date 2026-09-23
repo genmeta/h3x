@@ -227,6 +227,40 @@ fn cancelling_write_with_no_error_preserves_read_direction() {
 }
 
 #[test]
+fn no_error_cancels_qpack_decode_only_when_reading_stops() {
+    for stop_read in [true, false] {
+        let streams = Streams::new(Role::Client);
+        let qpack = qpack();
+        let feedback = Arc::new(Mutex::new(Vec::new()));
+        let captured = feedback.clone();
+        qpack
+            .with_state(|state| {
+                state.decoder.on_instruction(move |batch| {
+                    captured.lock().unwrap().push(format!("{batch:?}"));
+                    Ok(())
+                });
+                Ok(())
+            })
+            .unwrap();
+        let (mut read, write, _, _) = insert_with_qpack(&streams, 0, qpack.clone());
+
+        if stop_read {
+            read.stop(ErrorCode::NoError.as_u64());
+        } else {
+            (&write).cancel(ErrorCode::NoError.as_u64());
+        }
+
+        let expected = if stop_read {
+            vec!["[StreamCancellation(0)]"]
+        } else {
+            vec![]
+        };
+        assert_eq!(*feedback.lock().unwrap(), expected);
+        assert!(qpack.error().is_none());
+    }
+}
+
+#[test]
 fn dropping_application_handles_only_unregisters_each_direction() {
     let streams = Streams::new(Role::Client);
     let clone = streams.clone();

@@ -35,3 +35,6 @@ build_handler \
 build_handler \
   wasi-http-stream-response-until-cancelled \
   wasi-http-stream-response-until-cancelled.wasm
+build_handler \
+  wasi-http-outgoing-client \
+  wasi-http-outgoing-client.wasm
