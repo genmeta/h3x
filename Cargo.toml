@@ -29,6 +29,6 @@ tokio = { version = "1", features = ["macros", "rt", "io-util", "sync", "time"] 
 http-body = "1"
 http-body-util = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
-wasmtime = "47"
+wasmtime = "48"
 wasmtime-wasi = { version = "47", features = ["p2"] }
 wasmtime-wasi-http = { version = "47", features = ["p2"] }
