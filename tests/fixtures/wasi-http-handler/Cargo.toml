@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "handlers/outgoing-client",
     "handlers/read-request-then-respond",
     "handlers/respond-then-read-request",
     "handlers/stream-response-until-cancelled",
