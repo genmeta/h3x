@@ -31,4 +31,4 @@ http-body-util = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 wasmtime = "47"
 wasmtime-wasi = { version = "47", features = ["p2"] }
-wasmtime-wasi-http = { version = "47", features = ["p2"] }
+wasmtime-wasi-http = { version = "48", features = ["p2"] }
