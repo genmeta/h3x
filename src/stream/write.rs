@@ -6,7 +6,7 @@ use std::{
 
 use bytes::Bytes;
 use qrecovery::send::CancelStream;
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::{ArcH3Stream, H3Stream, StreamEventHandler};
 use crate::{
@@ -242,7 +242,7 @@ where
             never_index: value.is_sensitive(),
         }));
         let trailers = request.trailers.clone();
-        let mut body = request.body;
+        let body = request.body;
         body.on_error(self.error_handler());
         let producer = body.clone();
         let result: crate::Result<()> = async {
@@ -252,20 +252,19 @@ where
             bytes.put_frame(&headers);
             self.write_all(&bytes).await.map_err(W::map_error)?;
 
-            let mut buf = vec![0; frame::MAX_DATA_CHUNK];
             loop {
-                let count = body
-                    .read(&mut buf)
+                let chunk = body
+                    .read_chunk(frame::MAX_DATA_CHUNK)
                     .await
                     .map_err(Error::from)
                     .map_err(Error::stream)?;
-                if count == 0 {
+                if chunk.is_empty() {
                     break;
                 }
                 bytes.clear();
-                bytes.put_frame(&Frame::new(Data(count)).map_err(Error::stream)?);
+                bytes.put_frame(&Frame::new(Data(chunk.len())).map_err(Error::stream)?);
                 self.write_all(&bytes).await.map_err(W::map_error)?;
-                self.write_all(&buf[..count]).await.map_err(W::map_error)?;
+                self.write_all(&chunk).await.map_err(W::map_error)?;
             }
             let trailer_fields = trailers.fields();
             if !trailer_fields.is_empty() {
@@ -339,20 +338,19 @@ where
             self.write_all(&bytes).await.map_err(W::map_error)?;
 
             if send_body {
-                let mut buf = vec![0; frame::MAX_DATA_CHUNK];
                 loop {
-                    let count = body
-                        .read(&mut buf)
+                    let chunk = body
+                        .read_chunk(frame::MAX_DATA_CHUNK)
                         .await
                         .map_err(Error::from)
                         .map_err(Error::stream)?;
-                    if count == 0 {
+                    if chunk.is_empty() {
                         break;
                     }
                     bytes.clear();
-                    bytes.put_frame(&Frame::new(Data(count)).map_err(Error::stream)?);
+                    bytes.put_frame(&Frame::new(Data(chunk.len())).map_err(Error::stream)?);
                     self.write_all(&bytes).await.map_err(W::map_error)?;
-                    self.write_all(&buf[..count]).await.map_err(W::map_error)?;
+                    self.write_all(&chunk).await.map_err(W::map_error)?;
                 }
             }
             if send_body {
@@ -402,6 +400,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct Io {
         bytes: Arc<Mutex<Vec<u8>>>,
+        writes: Arc<Mutex<Vec<(usize, usize)>>>,
         cancels: Arc<Mutex<Vec<u64>>>,
         shutdowns: Arc<AtomicUsize>,
     }
@@ -412,6 +411,10 @@ mod tests {
             _: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((buf.as_ptr() as usize, buf.len()));
             self.bytes.lock().unwrap().extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
         }
@@ -583,6 +586,42 @@ mod tests {
             &*cancels.lock().unwrap(),
             &[ErrorCode::InternalError.as_u64()]
         );
+    }
+
+    #[tokio::test]
+    async fn message_writers_pass_owned_payload_to_transport_without_copying() {
+        for response in [false, true] {
+            let data = Bytes::from(vec![42; frame::MAX_DATA_CHUNK + 17]);
+            let address = data.as_ptr() as usize;
+            let mut body = crate::ArcWndBuf::new(data.len());
+            body.write_bytes(data.clone()).await.unwrap();
+            body.shutdown().await.unwrap();
+            let io = Io::default();
+            let writes = io.writes.clone();
+            let stream = H3WriteStream::new(0, io, events());
+            let qpack = crate::qpack::tests::qpack();
+            if response {
+                stream
+                    .write_response(http::Response::new(body).into(), http::Method::GET, qpack)
+                    .await
+                    .unwrap();
+            } else {
+                stream
+                    .write_request(
+                        http::Request::builder()
+                            .uri("https://example.com/")
+                            .body(body)
+                            .unwrap()
+                            .into(),
+                        qpack,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let writes = writes.lock().unwrap();
+            assert!(writes.contains(&(address, frame::MAX_DATA_CHUNK)));
+            assert!(writes.contains(&(address + frame::MAX_DATA_CHUNK, 17)));
+        }
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ mod support;
 
 use std::time::Duration;
 
-use h3x::ErrorCode;
+use h3x::{ErrorCode, ReadResponse};
 use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -113,4 +113,29 @@ async fn dropping_both_directions_wakes_drain() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_response_headers_after_no_error_upload_stop_still_stops_peer_writer() {
+    for poll_before_drop in [false, true] {
+        let (client, server) = support::connection_pair();
+        let (mut request_writer, response_reader) = client.open_bi().await.unwrap();
+        let (mut response_writer, mut request_reader) = server.accept_bi().await.unwrap();
+        request_reader.stop(ErrorCode::NoError.as_u64());
+        let error = request_writer.write_all(b"upload").await.unwrap_err();
+        assert_eq!(h3x::Error::from(error).code, ErrorCode::NoError);
+
+        let mut reading =
+            Box::pin(response_reader.read_response(http::Method::POST, client.qpack().clone()));
+        if poll_before_drop {
+            std::future::poll_fn(|cx| {
+                assert!(reading.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        drop(reading);
+        let error = response_writer.write_all(b"headers").await.unwrap_err();
+        assert_eq!(h3x::Error::from(error).code, ErrorCode::RequestCancelled);
+    }
 }

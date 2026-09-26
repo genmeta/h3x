@@ -198,6 +198,28 @@ let trailers = response.trailers();
 ```
 
 ArcWndBuf clones share the buffer.
+For adapters that already own `bytes::Bytes`, use
+`body.write_bytes(bytes).await` and `body.read_chunk(limit).await` (or
+`poll_read_chunk`) to transfer payload ownership without copying through the
+window. An empty read chunk means EOF; `limit` must be nonzero. Chunk boundaries
+are not message or HTTP/3 frame boundaries. The existing `AsyncRead` and
+`AsyncWrite` interfaces remain available and may be mixed with chunk I/O;
+borrowed writes copy into a coalescing buffer and borrowed reads copy out.
+Both interfaces share one pending reader and one pending writer, the byte
+capacity, EOF, and cancellation state.
+
+The receive task reads DATA into owned chunks, and the send task passes chunk
+slices directly to the transport, capped at the normal DATA frame size. WASI
+HTTP adapters can pass `Frame<Bytes>` payloads through the same chunk API without
+an intermediate byte buffer. This removes host-side body staging copies, not
+copies in the QUIC implementation or across the Wasm linear-memory boundary.
+Capacity limits queued payload bytes, not backing allocations: a small `Bytes`
+slice can retain its larger allocation, and chunks retained by consumers are
+outside the queue budget. Use reasonably sized source allocations for strict
+memory budgets. Like `write_all`, cancelling `write_bytes` can leave an accepted
+prefix queued; `poll_write_bytes` advances a caller-owned `Bytes` only by the
+accepted prefix for callers that need resumable writes.
+
 Use Tokio's `AsyncReadExt` / `AsyncWriteExt` directly with ArcWndBuf. Call
 `shutdown().await` on the producer to finish production. The polled write future
 drains the buffer and sends FIN. Use `stop(code)` or `cancel(code)` on the window

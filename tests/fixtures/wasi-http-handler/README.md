@@ -24,6 +24,12 @@ WASM OutgoingRequest -> Wasmtime http::Request<HyperOutgoingBody>
   -> h3x test peer -> Response<R> -> WASI IncomingResponse -> WASM
 ```
 
+Both host adapters transfer body payloads using `ArcWndBuf::write_bytes` and
+`poll_read_chunk`. Owned `Bytes` chunks are preserved through the host window
+and the HTTP/3 writer rather than copied through an `AsyncRead` scratch buffer.
+The window still applies byte-based backpressure; Wasm ABI and transport copies
+are outside this optimization.
+
 The tests exercise real WASM components and h3x framing/QPACK over the existing
 in-memory transport, not a network QUIC/TLS handshake. The client sends two
 requests on the same connection in every scenario: the selected case followed

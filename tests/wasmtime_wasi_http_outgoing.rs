@@ -16,7 +16,7 @@ use http_body::{Body, Frame};
 use http_body_util::{BodyExt, Empty};
 use qrecovery::{recv::StopSending, send::CancelStream};
 use support::{Connection, connection_pair};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wasmtime::{
     Engine, Store,
     component::{Component, Linker, ResourceTable},
@@ -73,7 +73,7 @@ impl WasiHttpHooks for H3Hooks {
                                 let frame = frame
                                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                                 match frame.into_data() {
-                                    Ok(data) => request.write_all(&data).await?,
+                                    Ok(data) => request.body().write_bytes(data).await?,
                                     Err(frame) => {
                                         for (name, value) in
                                             &frame.into_trailers().expect("body trailer frame")
@@ -136,22 +136,18 @@ impl Body for H3ResponseBody {
         if self.finished {
             return Poll::Ready(None);
         }
-        let mut bytes = [0; 4096];
-        let mut buffer = ReadBuf::new(&mut bytes);
-        match Pin::new(&mut self.response).poll_read(cx, &mut buffer) {
+        match self.response.body().poll_read_chunk(cx, 4096) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => {
                 self.finished = true;
                 Poll::Ready(Some(Err(body_error(error))))
             }
-            Poll::Ready(Ok(())) if buffer.filled().is_empty() => {
+            Poll::Ready(Ok(chunk)) if chunk.is_empty() => {
                 self.finished = true;
                 let trailers = self.response.trailers();
                 Poll::Ready((!trailers.is_empty()).then(|| Ok(Frame::trailers(trailers))))
             }
-            Poll::Ready(Ok(())) => Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(
-                buffer.filled(),
-            ))))),
+            Poll::Ready(Ok(chunk)) => Poll::Ready(Some(Ok(Frame::data(chunk)))),
         }
     }
 }
