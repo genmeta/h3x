@@ -41,6 +41,17 @@ pub struct H3Connection<T: Transport> {
 }
 
 impl<T: Transport> H3Connection<T> {
+    /// Borrow the underlying transport.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    /// Close the underlying transport immediately. Use `goaway` to drain
+    /// admitted requests before closing.
+    pub fn close(&self, reason: impl Into<String>, code: u64) -> Result<()> {
+        self.transport.close(reason.into(), code)
+    }
+
     /// Start the control, SETTINGS, and connection tasks.
     /// On failure or cancellation, transport cleanup follows its own drop semantics.
     pub fn new(transport: T, settings: Settings) -> Result<Self> {
@@ -758,5 +769,60 @@ mod tests {
         io.write_all(b"test").await.unwrap();
         io.flush().await.unwrap();
         io.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pool_registers_and_drains_established_connections() {
+        let pool = crate::Pool::new(|_: u8| async {
+            Err::<H3Connection<TestTransport>, crate::Error>(
+                ErrorCode::InternalError.connection("factory should not run"),
+            )
+        });
+        let rejected = connection(TestTransport::new(
+            None,
+            Err(ErrorCode::InternalError.connection("unused")),
+        ));
+        let connection = connection(TestTransport::new(
+            None,
+            Err(ErrorCode::InternalError.connection("unused")),
+        ));
+
+        assert!(pool.insert(1, connection.clone()).is_ok());
+        assert!(pool.insert(1, connection.clone()).is_err());
+        assert!(pool.insert(1, rejected.clone()).is_err());
+        assert!(!pool.remove_connection(&1, &rejected));
+        let registered = pool.get(&1).await.unwrap();
+        assert!(Arc::ptr_eq(&registered.transport, &connection.transport));
+        assert_eq!(pool.drain().len(), 1);
+        assert!(!pool.remove(&1));
+    }
+
+    #[tokio::test]
+    async fn pool_keeps_one_connection_from_each_direction() {
+        let pool = crate::Pool::new(|_: u8| async {
+            Ok::<_, crate::Error>(connection(TestTransport::new(
+                None,
+                Err(ErrorCode::InternalError.connection("unused")),
+            )))
+        });
+        let outbound = pool.get(&1).await.unwrap();
+        assert!(pool.insert(1, outbound.clone()).is_err());
+        let inbound = connection(TestTransport::new(
+            None,
+            Err(ErrorCode::InternalError.connection("unused")),
+        ));
+        let rejected = connection(TestTransport::new(
+            None,
+            Err(ErrorCode::InternalError.connection("unused")),
+        ));
+        assert!(pool.insert(1, inbound.clone()).is_ok());
+        assert!(pool.insert(1, rejected.clone()).is_err());
+        assert!(!pool.remove_connection(&1, &rejected));
+        let reused = pool.get(&1).await.unwrap();
+        assert!(Arc::ptr_eq(&reused.transport, &outbound.transport));
+        assert!(pool.remove_connection(&1, &outbound));
+        let reused = pool.get(&1).await.unwrap();
+        assert!(Arc::ptr_eq(&reused.transport, &inbound.transport));
+        assert_eq!(pool.drain().len(), 1);
     }
 }
