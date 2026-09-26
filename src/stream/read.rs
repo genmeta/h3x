@@ -248,71 +248,102 @@ impl<R> ReadRequest for H3ReadStream<R>
 where
     R: AsyncRead + StopSending + TransportError + Unpin + Send + 'static,
 {
-    async fn read_request(mut self, qpack: ArcQpack) -> crate::Result<Request<crate::R>> {
-        let mut body = crate::ArcWndBuf::new(frame::MAX_DATA_CHUNK);
-        body.on_error(self.error_handler());
-        let consumer = body.clone();
-        let request = async {
-            let frame = self.read_headers_frame().await?.ok_or_else(|| {
-                ErrorCode::RequestIncomplete.stream("stream ended before request HEADERS")
-            })?;
-            let fields = self.decode(&qpack, frame.payload.field_section).await?;
-            Request::from_fields(fields, consumer).map_err(Error::stream)
-        }
-        .await
-        .map_err(|failure| {
-            let failure = if failure.is_connection() {
-                qpack.on_connection_error(failure)
-            } else {
-                failure.stream()
-            };
-            self.fail(failure.clone());
-            qpack.error().unwrap_or(failure)
-        })?;
-        let message_trailers = request.trailers.clone();
-
-        tokio::spawn(async move {
-            let result: crate::Result<()> = async {
-                let mut trailers = false;
-                while let Some(frame) = self.read_next_frame(trailers).await? {
-                    match frame {
-                        NextFrame::Data(frame) => {
-                            let mut payload = (&mut self).take(frame.length.into_u64());
-                            tokio::io::copy(&mut payload, &mut body)
-                                .await
-                                .map_err(R::map_error)?;
-                            if payload.limit() != 0 {
-                                return Err(ErrorCode::FrameError.connection(
-                                    "DATA payload ended before the declared frame length",
-                                ));
-                            }
-                        }
-                        NextFrame::Trailer(frame) => {
-                            let fields = self.decode(&qpack, frame.payload.field_section).await?;
-                            message_trailers
-                                .extend_fields(fields)
-                                .map_err(Error::stream)?;
-                            trailers = true;
-                        }
-                    }
-                }
-                body.shutdown()
-                    .await
-                    .map_err(Error::from)
-                    .map_err(Error::stream)?;
-                Ok(())
+    fn read_request(
+        self,
+        qpack: ArcQpack,
+    ) -> impl Future<Output = crate::Result<Request<crate::R>>> + Send {
+        // Own cancellation before the future is returned, including an unpolled Drop.
+        // Once HEADERS succeed, the body task takes ownership of this direction.
+        let reader = scopeguard::guard(self, |mut reader| {
+            reader.stop(ErrorCode::RequestCancelled.as_u64());
+        });
+        async move {
+            let mut reader = reader;
+            let mut body = crate::ArcWndBuf::new(frame::MAX_DATA_CHUNK);
+            body.on_error(reader.error_handler());
+            let consumer = body.clone();
+            let request = async {
+                let frame = reader.read_headers_frame().await?.ok_or_else(|| {
+                    ErrorCode::RequestIncomplete.stream("stream ended before request HEADERS")
+                })?;
+                let fields = reader.decode(&qpack, frame.payload.field_section).await?;
+                Request::from_fields(fields, consumer).map_err(Error::stream)
             }
-            .await;
-            if let Err(failure) = result {
+            .await
+            .map_err(|failure| {
                 let failure = if failure.is_connection() {
                     qpack.on_connection_error(failure)
                 } else {
                     failure.stream()
                 };
-                body.error(failure);
-            }
-        });
-        Ok(request)
+                reader.fail(failure.clone());
+                qpack.error().unwrap_or(failure)
+            })?;
+            let message_trailers = request.trailers.clone();
+
+            let mut reader = scopeguard::ScopeGuard::into_inner(reader);
+            tokio::spawn(async move {
+                let result: crate::Result<()> = async {
+                    let mut trailers = false;
+                    while let Some(frame) = reader.read_next_frame(trailers).await? {
+                        match frame {
+                            NextFrame::Data(frame) => {
+                                let mut payload = (&mut reader).take(frame.length.into_u64());
+                                let mut chunk = bytes::BytesMut::new();
+                                while payload.limit() > 0 {
+                                    // Keep unused slab capacity across short transport reads.
+                                    // Otherwise a one-byte read could retain an entire 8 KiB
+                                    // allocation for every queued byte.
+                                    if chunk.capacity() == 0 {
+                                        chunk.reserve(
+                                            payload.limit().min(frame::MAX_DATA_CHUNK as u64)
+                                                as usize,
+                                        );
+                                    }
+                                    if payload.read_buf(&mut chunk).await.map_err(R::map_error)?
+                                        == 0
+                                    {
+                                        break;
+                                    }
+                                    body.write_bytes(chunk.split().freeze())
+                                        .await
+                                        .map_err(Error::from)
+                                        .map_err(Error::stream)?;
+                                }
+                                if payload.limit() != 0 {
+                                    return Err(ErrorCode::FrameError.connection(
+                                        "DATA payload ended before the declared frame length",
+                                    ));
+                                }
+                            }
+                            NextFrame::Trailer(frame) => {
+                                let fields =
+                                    reader.decode(&qpack, frame.payload.field_section).await?;
+                                message_trailers
+                                    .extend_fields(fields)
+                                    .map_err(Error::stream)?;
+                                trailers = true;
+                            }
+                        }
+                    }
+                    body.shutdown()
+                        .await
+                        .map_err(Error::from)
+                        .map_err(Error::stream)?;
+                    Ok(())
+                }
+                .await;
+                if let Err(failure) = result {
+                    let failure = if failure.is_connection() {
+                        qpack.on_connection_error(failure)
+                    } else {
+                        failure.stream()
+                    };
+                    body.error(failure);
+                }
+            });
+            Ok(request)
+        }
     }
 }
 
@@ -320,95 +351,123 @@ impl<R> ReadResponse for H3ReadStream<R>
 where
     R: AsyncRead + StopSending + TransportError + Unpin + Send + 'static,
 {
-    async fn read_response(
-        mut self,
+    fn read_response(
+        self,
         request_method: http::Method,
         qpack: ArcQpack,
-    ) -> crate::Result<Response<crate::R>> {
-        let mut body = crate::ArcWndBuf::new(frame::MAX_DATA_CHUNK);
-        body.on_error(self.error_handler());
-        let consumer = body.clone();
-        let response = async {
-            loop {
-                let frame = self.read_headers_frame().await?.ok_or_else(|| {
-                    ErrorCode::RequestIncomplete
-                        .stream("stream ended before final response HEADERS")
-                })?;
-                let fields = self.decode(&qpack, frame.payload.field_section).await?;
-                let response =
-                    Response::from_fields(fields, consumer.clone()).map_err(Error::stream)?;
-                if response.status().is_informational() {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                return Ok::<_, Error>(response);
-            }
-        }
-        .await
-        .map_err(|failure| {
-            let failure = if failure.is_connection() {
-                qpack.on_connection_error(failure)
-            } else {
-                failure.stream()
-            };
-            self.fail(failure.clone());
-            qpack.error().unwrap_or(failure)
-        })?;
-
-        let body_allowed = request_method != http::Method::HEAD
-            && response.status() != http::StatusCode::NO_CONTENT
-            && response.status() != http::StatusCode::NOT_MODIFIED;
-        let message_trailers = response.trailers.clone();
-        tokio::spawn(async move {
-            let result: crate::Result<()> = async {
-                let mut trailers = false;
-                while let Some(frame) = self.read_next_frame(trailers).await? {
-                    match frame {
-                        NextFrame::Data(frame) => {
-                            if !body_allowed {
-                                return Err(ErrorCode::MessageError
-                                    .stream("DATA is not allowed for this response"));
-                            }
-                            let mut payload = (&mut self).take(frame.length.into_u64());
-                            tokio::io::copy(&mut payload, &mut body)
-                                .await
-                                .map_err(R::map_error)?;
-                            if payload.limit() != 0 {
-                                return Err(ErrorCode::FrameError.connection(
-                                    "DATA payload ended before the declared frame length",
-                                ));
-                            }
-                        }
-                        NextFrame::Trailer(frame) => {
-                            if !body_allowed {
-                                return Err(ErrorCode::MessageError
-                                    .stream("trailers are not allowed for this response"));
-                            }
-                            let fields = self.decode(&qpack, frame.payload.field_section).await?;
-                            message_trailers
-                                .extend_fields(fields)
-                                .map_err(Error::stream)?;
-                            trailers = true;
-                        }
+    ) -> impl Future<Output = crate::Result<Response<crate::R>>> + Send {
+        // Own cancellation before the future is returned, including an unpolled Drop.
+        // Once HEADERS succeed, the body task takes ownership of this direction.
+        let reader = scopeguard::guard(self, |mut reader| {
+            reader.stop(ErrorCode::RequestCancelled.as_u64());
+        });
+        async move {
+            let mut reader = reader;
+            let mut body = crate::ArcWndBuf::new(frame::MAX_DATA_CHUNK);
+            body.on_error(reader.error_handler());
+            let consumer = body.clone();
+            let response = async {
+                loop {
+                    let frame = reader.read_headers_frame().await?.ok_or_else(|| {
+                        ErrorCode::RequestIncomplete
+                            .stream("stream ended before final response HEADERS")
+                    })?;
+                    let fields = reader.decode(&qpack, frame.payload.field_section).await?;
+                    let response =
+                        Response::from_fields(fields, consumer.clone()).map_err(Error::stream)?;
+                    if response.status().is_informational() {
+                        tokio::task::yield_now().await;
+                        continue;
                     }
+                    return Ok::<_, Error>(response);
                 }
-                body.shutdown()
-                    .await
-                    .map_err(Error::from)
-                    .map_err(Error::stream)?;
-                Ok(())
             }
-            .await;
-            if let Err(failure) = result {
+            .await
+            .map_err(|failure| {
                 let failure = if failure.is_connection() {
                     qpack.on_connection_error(failure)
                 } else {
                     failure.stream()
                 };
-                body.error(failure);
-            }
-        });
-        Ok(response)
+                reader.fail(failure.clone());
+                qpack.error().unwrap_or(failure)
+            })?;
+
+            let body_allowed = request_method != http::Method::HEAD
+                && response.status() != http::StatusCode::NO_CONTENT
+                && response.status() != http::StatusCode::NOT_MODIFIED;
+            let message_trailers = response.trailers.clone();
+            let mut reader = scopeguard::ScopeGuard::into_inner(reader);
+            tokio::spawn(async move {
+                let result: crate::Result<()> = async {
+                    let mut trailers = false;
+                    while let Some(frame) = reader.read_next_frame(trailers).await? {
+                        match frame {
+                            NextFrame::Data(frame) => {
+                                if !body_allowed {
+                                    return Err(ErrorCode::MessageError
+                                        .stream("DATA is not allowed for this response"));
+                                }
+                                let mut payload = (&mut reader).take(frame.length.into_u64());
+                                let mut chunk = bytes::BytesMut::new();
+                                while payload.limit() > 0 {
+                                    // Keep unused slab capacity across short transport reads.
+                                    // Otherwise a one-byte read could retain an entire 8 KiB
+                                    // allocation for every queued byte.
+                                    if chunk.capacity() == 0 {
+                                        chunk.reserve(
+                                            payload.limit().min(frame::MAX_DATA_CHUNK as u64)
+                                                as usize,
+                                        );
+                                    }
+                                    if payload.read_buf(&mut chunk).await.map_err(R::map_error)?
+                                        == 0
+                                    {
+                                        break;
+                                    }
+                                    body.write_bytes(chunk.split().freeze())
+                                        .await
+                                        .map_err(Error::from)
+                                        .map_err(Error::stream)?;
+                                }
+                                if payload.limit() != 0 {
+                                    return Err(ErrorCode::FrameError.connection(
+                                        "DATA payload ended before the declared frame length",
+                                    ));
+                                }
+                            }
+                            NextFrame::Trailer(frame) => {
+                                if !body_allowed {
+                                    return Err(ErrorCode::MessageError
+                                        .stream("trailers are not allowed for this response"));
+                                }
+                                let fields =
+                                    reader.decode(&qpack, frame.payload.field_section).await?;
+                                message_trailers
+                                    .extend_fields(fields)
+                                    .map_err(Error::stream)?;
+                                trailers = true;
+                            }
+                        }
+                    }
+                    body.shutdown()
+                        .await
+                        .map_err(Error::from)
+                        .map_err(Error::stream)?;
+                    Ok(())
+                }
+                .await;
+                if let Err(failure) = result {
+                    let failure = if failure.is_connection() {
+                        qpack.on_connection_error(failure)
+                    } else {
+                        failure.stream()
+                    };
+                    body.error(failure);
+                }
+            });
+            Ok(response)
+        }
     }
 }
 
@@ -502,6 +561,91 @@ mod tests {
     impl TransportError for PendingIo {
         fn map_error(error: io::Error) -> Error {
             Error::from_stream_io(error)
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_header_futures_stops_unpolled_and_pending_native_reads() {
+        use futures::FutureExt;
+
+        for response in [false, true] {
+            for poll_before_drop in [false, true] {
+                let stops = Arc::new(Mutex::new(Vec::new()));
+                let stream = H3ReadStream::new(
+                    0,
+                    PendingIo {
+                        bytes: Vec::new(),
+                        offset: 0,
+                        stops: stops.clone(),
+                    },
+                    events(),
+                );
+                let state = stream.state.clone();
+                let qpack = crate::qpack::tests::qpack();
+                let mut reading = if response {
+                    stream
+                        .read_response(http::Method::GET, qpack)
+                        .map(|result| result.map(|_| ()))
+                        .boxed()
+                } else {
+                    stream
+                        .read_request(qpack)
+                        .map(|result| result.map(|_| ()))
+                        .boxed()
+                };
+                if poll_before_drop {
+                    poll_fn(|cx| {
+                        assert!(reading.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                assert!(stops.lock().unwrap().is_empty());
+                drop(reading);
+                assert_eq!(
+                    *stops.lock().unwrap(),
+                    [ErrorCode::RequestCancelled.as_u64()]
+                );
+                assert_eq!(
+                    state.0.lock().unwrap().as_ref().err().unwrap().code,
+                    ErrorCode::RequestCancelled
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn header_failure_preserves_original_error_and_native_stop_code() {
+        for response in [false, true] {
+            let stops = Arc::new(Mutex::new(Vec::new()));
+            // A DATA frame before HEADERS is a connection-level FRAME_UNEXPECTED.
+            let stream = H3ReadStream::new(
+                0,
+                PendingIo {
+                    bytes: vec![0, 0],
+                    offset: 0,
+                    stops: stops.clone(),
+                },
+                events(),
+            );
+            let state = stream.state.clone();
+            let qpack = crate::qpack::tests::qpack();
+            let error = if response {
+                stream
+                    .read_response(http::Method::GET, qpack)
+                    .await
+                    .err()
+                    .unwrap()
+            } else {
+                stream.read_request(qpack).await.err().unwrap()
+            };
+            assert_eq!(error.code, ErrorCode::FrameUnexpected);
+            assert!(error.is_connection());
+            assert_eq!(
+                *stops.lock().unwrap(),
+                [ErrorCode::FrameUnexpected.as_u64()]
+            );
+            assert_eq!(state.0.lock().unwrap().as_ref().err().unwrap(), &error);
         }
     }
 
@@ -781,6 +925,113 @@ mod tests {
         };
         assert_eq!(error.code, ErrorCode::RequestIncomplete);
         assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn short_data_reads_share_a_slab_without_window_copies() {
+        struct ShortIo {
+            wire: Vec<u8>,
+            offset: usize,
+            payload_start: usize,
+            addresses: Arc<Mutex<Vec<usize>>>,
+        }
+        impl AsyncRead for ShortIo {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                if buf.remaining() > 0 && self.offset < self.wire.len() {
+                    let start = buf.filled().len();
+                    buf.put_slice(&self.wire[self.offset..self.offset + 1]);
+                    if self.offset >= self.payload_start {
+                        self.addresses
+                            .lock()
+                            .unwrap()
+                            .push(buf.filled()[start..].as_ptr() as usize);
+                    }
+                    self.offset += 1;
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl StopSending for ShortIo {
+            fn stop(&mut self, _: u64) {}
+        }
+        impl TransportError for ShortIo {
+            fn map_error(error: io::Error) -> Error {
+                Error::from_stream_io(error)
+            }
+        }
+        for response in [false, true] {
+            let qpack = crate::qpack::tests::qpack();
+            let field = |name: &'static [u8], value: &'static [u8]| crate::qpack::Field {
+                name: Bytes::from_static(name),
+                value: Bytes::from_static(value),
+                never_index: false,
+            };
+            let fields = if response {
+                vec![field(b":status", b"200")]
+            } else {
+                vec![
+                    field(b":method", b"GET"),
+                    field(b":scheme", b"https"),
+                    field(b":authority", b"example.com"),
+                    field(b":path", b"/"),
+                ]
+            };
+            let mut wire = Vec::new();
+            wire.put_frame(
+                &Frame::new(frame::Headers {
+                    field_section: qpack.encode(0, fields).unwrap(),
+                })
+                .unwrap(),
+            );
+            wire.put_frame(&Frame::new(frame::Data(64)).unwrap());
+            let payload_start = wire.len();
+            wire.extend_from_slice(&[42; 64]);
+            let addresses = Arc::new(Mutex::new(Vec::new()));
+            let stream = H3ReadStream::new(
+                0,
+                ShortIo {
+                    wire,
+                    offset: 0,
+                    payload_start,
+                    addresses: addresses.clone(),
+                },
+                events(),
+            );
+            let body = if response {
+                stream
+                    .read_response(http::Method::GET, qpack)
+                    .await
+                    .unwrap()
+                    .into_body()
+            } else {
+                stream.read_request(qpack).await.unwrap().into_body()
+            };
+            // Retain all chunks so the allocator cannot reuse a freed address.
+            let mut chunks = Vec::new();
+            loop {
+                let chunk = body.read_chunk(64).await.unwrap();
+                if chunk.is_empty() {
+                    break;
+                }
+                assert_eq!(&chunk[..], &[42]);
+                chunks.push(chunk);
+            }
+            let received: Vec<_> = chunks.iter().map(|b| b.as_ptr() as usize).collect();
+            let addresses = addresses.lock().unwrap();
+            assert_eq!(received.len(), 64);
+            assert_eq!(
+                received, *addresses,
+                "transport buffer reaches the consumer unchanged"
+            );
+            assert!(
+                received.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                "short reads share the slab instead of allocating one slab per byte"
+            );
+        }
     }
 
     #[tokio::test]

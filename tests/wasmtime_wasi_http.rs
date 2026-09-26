@@ -10,7 +10,6 @@ use axum::{
     routing::post,
 };
 use bytes::Bytes;
-use futures::{StreamExt, TryStreamExt};
 use h3x::{
     ArcWndBuf, R, ReadRequest, ReadResponse, Request, Response, Trailers, W, WriteRequest,
     WriteResponse,
@@ -21,7 +20,6 @@ use http_body_util::{BodyExt, StreamBody};
 use qrecovery::{recv::StopSending, send::CancelStream};
 use support::{Connection, connection_pair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_util::io::ReaderStream;
 use tower::ServiceExt;
 use wasmtime::{
     Engine, Store,
@@ -157,7 +155,7 @@ async fn healthy_adapter_response() -> AxumResponse {
 // Request body and trailers:
 // client `request.write_all(...)` / `request.shutdown()`
 //   → h3x `Request<R>` backed by `ArcWndBuf`
-//   → `ReaderStream::new(body)` / `StreamBody::new(frames)` / `AxumBody::new(...)`
+//   → chunk stream / `StreamBody::new(frames)` / `AxumBody::new(...)`
 //   → `new_incoming_request(...)`
 //   → guest `request.consume()` / `input.read_to_end(...)` / `IncomingBody::finish(...)`
 //
@@ -172,7 +170,7 @@ async fn healthy_adapter_response() -> AxumResponse {
 // Response body and trailers:
 // guest `response_body.write()` / `output.write_all(...)` / `OutgoingBody::finish(...)`
 //   → `HyperOutgoingBody` / `AxumBody::new(body)` / `body.frame().await`
-//   → `response.write_all(...)` / `response.append_trailer(...)`
+//   → `response.body().write_bytes(...)` / `response.append_trailer(...)`
 //   → shared `ArcWndBuf` read by `writer.write_response(response.clone(), ...)`
 //   → H3 DATA / trailing HEADERS
 
@@ -228,11 +226,24 @@ async fn serve(
 
     let (mut parts, body) = request.into_parts();
     let trailers = parts.extensions.remove::<Trailers>().unwrap();
-    let frames = ReaderStream::new(body)
-        .map_ok(Frame::data)
-        .chain(futures::stream::once(async move {
-            Ok::<_, std::io::Error>(Frame::trailers(trailers.headers()))
-        }));
+    let mut finished = false;
+    let frames = futures::stream::poll_fn(move |cx| {
+        if finished {
+            return std::task::Poll::Ready(None);
+        }
+        body.poll_read_chunk(cx, 8192).map(|result| match result {
+            Ok(chunk) if chunk.is_empty() => {
+                finished = true;
+                let trailers = trailers.headers();
+                (!trailers.is_empty()).then(|| Ok(Frame::trailers(trailers)))
+            }
+            Ok(chunk) => Some(Ok(Frame::data(chunk))),
+            Err(error) => {
+                finished = true;
+                Some(Err(error))
+            }
+        })
+    });
     let request = http::Request::from_parts(parts, AxumBody::new(StreamBody::new(frames)));
 
     let mut response = router.oneshot(request).await.unwrap();
@@ -249,7 +260,7 @@ async fn serve(
                     .into_data()
                 {
                     Ok(data) => {
-                        response.write_all(&data).await?;
+                        response.body().write_bytes(data).await?;
                         // Make the guest exercise Wasmtime's bounded output channel.
                         tokio::time::sleep(Duration::from_millis(2)).await;
                     }

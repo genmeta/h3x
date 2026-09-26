@@ -1,10 +1,13 @@
 use std::{
+    collections::VecDeque,
+    future::poll_fn,
     io,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
 
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::Error;
@@ -12,9 +15,10 @@ use crate::Error;
 /// A bounded FIFO with one pending reader and one pending writer.
 #[derive(Debug)]
 pub(crate) struct WndBuf {
-    buf: Vec<u8>,
-    head: usize,
-    tail: usize,
+    chunks: VecDeque<Bytes>,
+    // Coalesce borrowed AsyncWrite calls until the consumer takes ownership.
+    pending: BytesMut,
+    capacity: usize,
     len: usize,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
@@ -26,9 +30,9 @@ impl WndBuf {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "window capacity must be nonzero");
         Self {
-            buf: vec![0; capacity],
-            head: 0,
-            tail: 0,
+            chunks: VecDeque::new(),
+            pending: BytesMut::new(),
+            capacity,
             len: 0,
             read_waker: None,
             write_waker: None,
@@ -54,10 +58,22 @@ impl AsyncRead for WndBuf {
             return Poll::Pending;
         }
         let len = buf.remaining().min(self.len);
-        let first = len.min(self.buf.len() - self.head);
-        buf.put_slice(&self.buf[self.head..self.head + first]);
-        buf.put_slice(&self.buf[..len - first]);
-        self.head = (self.head + len) % self.buf.len();
+        let mut remaining = len;
+        while remaining > 0 {
+            if let Some(chunk) = self.chunks.front_mut() {
+                let count = remaining.min(chunk.len());
+                buf.put_slice(&chunk[..count]);
+                chunk.advance(count);
+                remaining -= count;
+                if chunk.is_empty() {
+                    self.chunks.pop_front();
+                }
+            } else {
+                buf.put_slice(&self.pending[..remaining]);
+                self.pending.advance(remaining);
+                break;
+            }
+        }
         self.len -= len;
         if len > 0
             && let Some(waker) = self.write_waker.take()
@@ -80,16 +96,12 @@ impl AsyncWrite for WndBuf {
         if self.fin {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
-        let len = buf.len().min(self.buf.len() - self.len);
+        let len = buf.len().min(self.capacity - self.len);
         if len == 0 {
             self.write_waker = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        let tail = self.tail;
-        let first = len.min(self.buf.len() - tail);
-        self.buf[tail..tail + first].copy_from_slice(&buf[..first]);
-        self.buf[..len - first].copy_from_slice(&buf[first..len]);
-        self.tail = (tail + len) % self.buf.len();
+        self.pending.extend_from_slice(&buf[..len]);
         self.len += len;
         if let Some(waker) = self.read_waker.take() {
             waker.wake();
@@ -134,6 +146,85 @@ impl ArcWndBuf {
             window: Arc::new(Mutex::new(Ok(WndBuf::with_capacity(capacity)))),
             error_cb: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Read up to `limit` bytes by transferring a shared chunk, without copying
+    /// its payload. Empty bytes mean EOF, after all queued data has been read.
+    /// Like AsyncRead, this window supports only one pending consumer.
+    /// Panics if `limit` is zero.
+    pub fn poll_read_chunk(&self, cx: &mut Context<'_>, limit: usize) -> Poll<io::Result<Bytes>> {
+        assert!(limit > 0, "chunk limit must be nonzero");
+        self.poll_io(|mut window| {
+            let mut chunk = match window.chunks.pop_front() {
+                Some(chunk) => chunk,
+                None if !window.pending.is_empty() => window.pending.split().freeze(),
+                None if window.fin => return Poll::Ready(Ok(Bytes::new())),
+                None => {
+                    window.read_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            };
+            let data = chunk.split_to(chunk.len().min(limit));
+            if !chunk.is_empty() {
+                window.chunks.push_front(chunk);
+            }
+            window.len -= data.len();
+            if let Some(waker) = window.write_waker.take() {
+                waker.wake();
+            }
+            Poll::Ready(Ok(data))
+        })
+    }
+
+    /// Async counterpart of [`Self::poll_read_chunk`]. Cancellation while
+    /// waiting does not consume data.
+    pub async fn read_chunk(&self, limit: usize) -> io::Result<Bytes> {
+        poll_fn(|cx| self.poll_read_chunk(cx, limit)).await
+    }
+
+    /// Transfer as many bytes as currently fit into the bounded queue. Only
+    /// the accepted prefix is removed from `bytes`; Pending leaves it intact.
+    /// Payloads are shared, not copied. Small slices may retain larger backing
+    /// allocations, so capacity bounds queued bytes, not retained allocations.
+    /// Only one producer may wait at a time, including AsyncWrite users.
+    pub fn poll_write_bytes(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &mut Bytes,
+    ) -> Poll<io::Result<usize>> {
+        self.poll_io(|mut window| {
+            if bytes.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            if window.fin {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+            let count = bytes.len().min(window.capacity - window.len);
+            if count == 0 {
+                window.write_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            if !window.pending.is_empty() {
+                let pending = window.pending.split().freeze();
+                window.chunks.push_back(pending);
+            }
+            window.chunks.push_back(bytes.split_to(count));
+            window.len += count;
+            if let Some(waker) = window.read_waker.take() {
+                waker.wake();
+            }
+            Poll::Ready(Ok(count))
+        })
+    }
+
+    /// Enqueue an owned chunk without copying its payload, waiting for space.
+    /// Like write_all, cancelling this future can leave a prefix enqueued;
+    /// use poll_write_bytes with a retained Bytes value to resume explicitly.
+    pub async fn write_bytes(&self, mut bytes: Bytes) -> io::Result<()> {
+        while !bytes.is_empty() {
+            poll_fn(|cx| self.poll_write_bytes(cx, &mut bytes)).await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn error(&self, error: Error) {
