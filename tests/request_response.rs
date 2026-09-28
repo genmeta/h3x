@@ -10,6 +10,19 @@ use qrecovery::recv::StopSending;
 use support::connection_pair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+async fn finished_body(bytes: &[u8]) -> WndBuf {
+    let mut body = WndBuf::new(bytes.len().max(1));
+    body.write_all(bytes).await.unwrap();
+    body.shutdown().await.unwrap();
+    body
+}
+
+async fn collect(mut body: WndBuf) -> String {
+    let mut bytes = Vec::new();
+    body.read_to_end(&mut bytes).await.unwrap();
+    String::from_utf8(bytes).unwrap()
+}
+
 #[tokio::test]
 async fn content_length_request_and_response() {
     let (client, server) = connection_pair();
@@ -523,17 +536,4 @@ async fn unknown_frames_after_trailers_are_ignored() {
             .unwrap(),
         0
     );
-}
-
-async fn finished_body(bytes: &[u8]) -> WndBuf {
-    let mut body = WndBuf::new(bytes.len().max(1));
-    body.write_all(bytes).await.unwrap();
-    body.shutdown().await.unwrap();
-    body
-}
-
-async fn collect(mut body: WndBuf) -> String {
-    let mut bytes = Vec::new();
-    body.read_to_end(&mut bytes).await.unwrap();
-    String::from_utf8(bytes).unwrap()
 }

@@ -18,6 +18,7 @@ mod settings;
 mod varint;
 
 #[cfg(test)]
+#[path = "../tests/unit/frame.rs"]
 mod tests;
 
 pub(crate) use varint::be_varint;
