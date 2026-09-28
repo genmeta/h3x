@@ -321,4 +321,5 @@ fn remove_rejected<T>(streams: &mut HashMap<u64, T>, boundary: u64) -> Vec<(u64,
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/stream/bi.rs"]
 mod tests;

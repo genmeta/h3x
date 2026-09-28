@@ -361,6 +361,85 @@ fn goaway_batches_more_cancellations_than_the_feedback_queue_capacity() {
     assert!(handles[0].1.3.codes().is_empty());
 }
 
+#[test]
+fn local_goaway_freezes_acceptance_and_preserves_registered_streams() {
+    for (role, first) in [(Role::Server, 0), (Role::Client, 1)] {
+        let streams = Streams::new(role);
+        let _admitted = insert(&streams, first + 4);
+        let _rejected = insert(&streams, first + 8);
+        let mut guard = streams.lock().unwrap();
+        guard.accept(sid(first + 4)).unwrap();
+        let mut notification = Box::pin(guard.local_goaway());
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(notification.as_mut().poll(&mut cx).is_pending());
+        guard.goaway(&qpack()).unwrap();
+        assert_eq!(
+            notification.as_mut().poll(&mut cx),
+            Poll::Ready(sid(first + 8))
+        );
+        assert_eq!(
+            guard.local_not_goway().unwrap_err().code,
+            ErrorCode::RequestRejected
+        );
+        assert!(guard.accept(sid(first)).is_err());
+        assert!(guard.accept(sid(first + 8)).is_err());
+        assert!(guard.remote_no_goway().is_ok());
+        assert!(guard.reads.contains_key(&(first + 4)));
+        assert!(!guard.reads.contains_key(&(first + 8)));
+        guard.goaway(&qpack()).unwrap();
+        let mut late = Box::pin(guard.local_goaway());
+        assert_eq!(late.as_mut().poll(&mut cx), Poll::Ready(sid(first + 8)));
+    }
+}
+
+#[test]
+fn remote_goaway_blocks_opening_without_starting_local_drain() {
+    let streams = Streams::new(Role::Client);
+    let _accepted = insert(&streams, 0);
+    let _rejected = insert(&streams, 4);
+    let mut drain = streams.drain();
+    let mut guard = streams.lock().unwrap();
+    let mut notification = Box::pin(guard.recv_goway());
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(notification.as_mut().poll(&mut cx).is_pending());
+    guard.on_goaway(sid(4), qpack()).unwrap();
+    assert!(notification.as_mut().poll(&mut cx).is_ready());
+    assert_eq!(
+        guard.remote_no_goway().unwrap_err().code,
+        ErrorCode::RequestRejected
+    );
+    assert!(guard.local_not_goway().is_ok());
+    assert!(guard.reads.contains_key(&0));
+    assert!(!guard.reads.contains_key(&4));
+    guard.on_goaway(sid(0), qpack()).unwrap();
+    assert!(guard.reads.is_empty());
+    assert!(guard.writes.is_empty());
+    drop(guard);
+    assert!(Pin::new(&mut drain).poll(&mut cx).is_pending());
+}
+
+#[test]
+fn close_clears_registries_propagates_error_and_completes_drain() {
+    let streams = Streams::new(Role::Server);
+    streams.lock().unwrap().accept(sid(4)).unwrap();
+    let handles: Vec<_> = [0, 4].into_iter().map(|id| insert(&streams, id)).collect();
+    let mut drain = streams.drain();
+    let mut guard = streams.lock().unwrap();
+    guard.goaway(&qpack()).unwrap();
+    guard.close(ErrorCode::InternalError.connection("test close"));
+    guard.close(ErrorCode::InternalError.connection("repeat close"));
+    assert!(guard.reads.is_empty());
+    assert!(guard.writes.is_empty());
+    drop(guard);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(Pin::new(&mut drain).poll(&mut cx).is_ready());
+    for (read, write, recv, send) in handles {
+        drop((read, write));
+        assert_eq!(recv.codes(), [ErrorCode::InternalError.as_u64()]);
+        assert_eq!(send.codes(), [ErrorCode::InternalError.as_u64()]);
+    }
+}
+
 struct ResetReader {
     bytes: &'static [u8],
     offset: usize,
@@ -531,83 +610,4 @@ async fn eof_after_informational_headers_cancels_the_request_direction() {
     drop(guard);
     assert!(qpack.error().is_none());
     drop(write);
-}
-
-#[test]
-fn local_goaway_freezes_acceptance_and_preserves_registered_streams() {
-    for (role, first) in [(Role::Server, 0), (Role::Client, 1)] {
-        let streams = Streams::new(role);
-        let _admitted = insert(&streams, first + 4);
-        let _rejected = insert(&streams, first + 8);
-        let mut guard = streams.lock().unwrap();
-        guard.accept(sid(first + 4)).unwrap();
-        let mut notification = Box::pin(guard.local_goaway());
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        assert!(notification.as_mut().poll(&mut cx).is_pending());
-        guard.goaway(&qpack()).unwrap();
-        assert_eq!(
-            notification.as_mut().poll(&mut cx),
-            Poll::Ready(sid(first + 8))
-        );
-        assert_eq!(
-            guard.local_not_goway().unwrap_err().code,
-            ErrorCode::RequestRejected
-        );
-        assert!(guard.accept(sid(first)).is_err());
-        assert!(guard.accept(sid(first + 8)).is_err());
-        assert!(guard.remote_no_goway().is_ok());
-        assert!(guard.reads.contains_key(&(first + 4)));
-        assert!(!guard.reads.contains_key(&(first + 8)));
-        guard.goaway(&qpack()).unwrap();
-        let mut late = Box::pin(guard.local_goaway());
-        assert_eq!(late.as_mut().poll(&mut cx), Poll::Ready(sid(first + 8)));
-    }
-}
-
-#[test]
-fn remote_goaway_blocks_opening_without_starting_local_drain() {
-    let streams = Streams::new(Role::Client);
-    let _accepted = insert(&streams, 0);
-    let _rejected = insert(&streams, 4);
-    let mut drain = streams.drain();
-    let mut guard = streams.lock().unwrap();
-    let mut notification = Box::pin(guard.recv_goway());
-    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    assert!(notification.as_mut().poll(&mut cx).is_pending());
-    guard.on_goaway(sid(4), qpack()).unwrap();
-    assert!(notification.as_mut().poll(&mut cx).is_ready());
-    assert_eq!(
-        guard.remote_no_goway().unwrap_err().code,
-        ErrorCode::RequestRejected
-    );
-    assert!(guard.local_not_goway().is_ok());
-    assert!(guard.reads.contains_key(&0));
-    assert!(!guard.reads.contains_key(&4));
-    guard.on_goaway(sid(0), qpack()).unwrap();
-    assert!(guard.reads.is_empty());
-    assert!(guard.writes.is_empty());
-    drop(guard);
-    assert!(Pin::new(&mut drain).poll(&mut cx).is_pending());
-}
-
-#[test]
-fn close_clears_registries_propagates_error_and_completes_drain() {
-    let streams = Streams::new(Role::Server);
-    streams.lock().unwrap().accept(sid(4)).unwrap();
-    let handles: Vec<_> = [0, 4].into_iter().map(|id| insert(&streams, id)).collect();
-    let mut drain = streams.drain();
-    let mut guard = streams.lock().unwrap();
-    guard.goaway(&qpack()).unwrap();
-    guard.close(ErrorCode::InternalError.connection("test close"));
-    guard.close(ErrorCode::InternalError.connection("repeat close"));
-    assert!(guard.reads.is_empty());
-    assert!(guard.writes.is_empty());
-    drop(guard);
-    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    assert!(Pin::new(&mut drain).poll(&mut cx).is_ready());
-    for (read, write, recv, send) in handles {
-        drop((read, write));
-        assert_eq!(recv.codes(), [ErrorCode::InternalError.as_u64()]);
-        assert_eq!(send.codes(), [ErrorCode::InternalError.as_u64()]);
-    }
 }

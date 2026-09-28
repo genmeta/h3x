@@ -36,6 +36,19 @@ const CHUNK_SIZE: usize = 4096;
 const CHUNKS: usize = 40;
 const CANCEL: u64 = h3x::ErrorCode::RequestCancelled.as_u64();
 
+fn fixture() -> &'static (Engine, Component) {
+    static FIXTURE: OnceLock<(Engine, Component)> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let engine = Engine::default();
+        let component = Component::from_binary(
+            &engine,
+            include_bytes!("fixtures/wasi-http-outgoing-client.wasm"),
+        )
+        .unwrap();
+        (engine, component)
+    })
+}
+
 type UploadJob = tokio::task::JoinHandle<(h3x::Result<()>, std::io::Result<()>)>;
 
 struct H3Hooks {
@@ -184,19 +197,6 @@ impl WasiHttpView for State {
             hooks: &mut self.hooks,
         }
     }
-}
-
-fn fixture() -> &'static (Engine, Component) {
-    static FIXTURE: OnceLock<(Engine, Component)> = OnceLock::new();
-    FIXTURE.get_or_init(|| {
-        let engine = Engine::default();
-        let component = Component::from_binary(
-            &engine,
-            include_bytes!("fixtures/wasi-http-outgoing-client.wasm"),
-        )
-        .unwrap();
-        (engine, component)
-    })
 }
 
 async fn guest(client: h3x::H3Connection<Connection>, path: &str) {

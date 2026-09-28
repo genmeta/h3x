@@ -10,6 +10,7 @@ keywords = ["async", "quic", "http3"]
 categories = ["network-programming", "asynchronous"]
 
 [lib]
+path = "src/h3x.rs"
 test = true
 doctest = false
 

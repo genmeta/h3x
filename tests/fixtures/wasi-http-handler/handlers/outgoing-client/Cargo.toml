@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [lib]
+path = "src/wasi_http_outgoing_client.rs"
 crate-type = ["cdylib"]
 
 [dependencies]

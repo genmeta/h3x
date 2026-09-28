@@ -40,6 +40,19 @@ async fn receive(wire: Vec<u8>) -> Result<Response<R>, h3x::Error> {
         .await
 }
 
+async fn finished_body(bytes: &[u8]) -> WndBuf {
+    let mut body = WndBuf::new(bytes.len().max(1));
+    body.write_all(bytes).await.unwrap();
+    body.shutdown().await.unwrap();
+    body
+}
+
+async fn collect(mut body: WndBuf) -> String {
+    let mut bytes = Vec::new();
+    body.read_to_end(&mut bytes).await.unwrap();
+    String::from_utf8(bytes).unwrap()
+}
+
 #[tokio::test]
 async fn informational_response_and_unknown_frames_before_final_headers() {
     let mut wire = vec![0x21, 2, 0xaa, 0xbb];
@@ -109,6 +122,29 @@ async fn incoming_head_body_is_streamed_without_length_validation() {
     invalid.extend([0, 1, b'x']);
     let response = receive(invalid).await.unwrap();
     assert_eq!(collect(response.into_body()).await, "x");
+}
+
+#[tokio::test]
+async fn repeated_regular_headers_are_preserved() {
+    let wire = headers(&[(":status", "200"), ("x-tag", "a"), ("x-tag", "b")]);
+    let response = receive(wire).await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(response.headers().get_all("x-tag").iter().count(), 2);
+}
+
+#[tokio::test]
+async fn malformed_response_pseudo_headers_are_rejected() {
+    for fields in [
+        vec![(":status", "201"), (":status", "200")],
+        vec![(":method", "GET"), (":status", "200")],
+        vec![("x-tag", "a"), (":status", "200")],
+    ] {
+        let error = match receive(headers(&fields)).await {
+            Ok(_) => panic!("malformed response was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::MessageError);
+    }
 }
 
 #[tokio::test]
@@ -250,42 +286,6 @@ async fn oversized_streaming_body_allows_producer_to_finish() {
         .await
         .unwrap();
     assert_eq!(collect(response.into_body()).await, "xy");
-}
-
-#[tokio::test]
-async fn repeated_regular_headers_are_preserved() {
-    let wire = headers(&[(":status", "200"), ("x-tag", "a"), ("x-tag", "b")]);
-    let response = receive(wire).await.unwrap();
-    assert_eq!(response.status(), http::StatusCode::OK);
-    assert_eq!(response.headers().get_all("x-tag").iter().count(), 2);
-}
-
-#[tokio::test]
-async fn malformed_response_pseudo_headers_are_rejected() {
-    for fields in [
-        vec![(":status", "201"), (":status", "200")],
-        vec![(":method", "GET"), (":status", "200")],
-        vec![("x-tag", "a"), (":status", "200")],
-    ] {
-        let error = match receive(headers(&fields)).await {
-            Ok(_) => panic!("malformed response was accepted"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, ErrorCode::MessageError);
-    }
-}
-
-async fn finished_body(bytes: &[u8]) -> WndBuf {
-    let mut body = WndBuf::new(bytes.len().max(1));
-    body.write_all(bytes).await.unwrap();
-    body.shutdown().await.unwrap();
-    body
-}
-
-async fn collect(mut body: WndBuf) -> String {
-    let mut bytes = Vec::new();
-    body.read_to_end(&mut bytes).await.unwrap();
-    String::from_utf8(bytes).unwrap()
 }
 
 #[tokio::test]
