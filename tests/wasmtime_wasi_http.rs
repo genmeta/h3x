@@ -10,16 +10,11 @@ use axum::{
     routing::post,
 };
 use bytes::Bytes;
-use h3x::{
-    ArcWndBuf, R, ReadRequest, ReadResponse, Request, Response, Trailers, W, WriteRequest,
-    WriteResponse,
-};
+use h3x::{ReadRequest, ReadResponse, WriteRequest, WriteResponse};
 use http::{Method, StatusCode};
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
-use qrecovery::{recv::StopSending, send::CancelStream};
 use support::{Connection, connection_pair};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 use wasmtime::{
     Engine, Store,
@@ -145,35 +140,6 @@ async fn healthy_adapter_response() -> AxumResponse {
     AxumResponse::new(AxumBody::from("healthy"))
 }
 
-// Request head:
-// client `writer.write_request(request, ...)`
-//   → server `reader.read_request(...)`
-//   → `request.into_parts()` / `http::Request::from_parts(...)`
-//   → `router.oneshot(request)` / `post(handle_wasm)`
-//   → `new_incoming_request(...)` / guest `call_handle(...)`
-//
-// Request body and trailers:
-// client `request.write_all(...)` / `request.shutdown()`
-//   → h3x `Request<R>` backed by `ArcWndBuf`
-//   → chunk stream / `StreamBody::new(frames)` / `AxumBody::new(...)`
-//   → `new_incoming_request(...)`
-//   → guest `request.consume()` / `input.read_to_end(...)` / `IncomingBody::finish(...)`
-//
-// Response head:
-// guest `ResponseOutparam::set(...)`
-//   → host `new_response_outparam(sender)` / `receiver.await`
-//   → `AxumResponse::from_parts(...)` / return from `handle_wasm`
-//   → `router.oneshot(request).await`
-//   → `Response::from_parts(...)` / `writer.write_response(...)`
-//   → H3 HEADERS
-//
-// Response body and trailers:
-// guest `response_body.write()` / `output.write_all(...)` / `OutgoingBody::finish(...)`
-//   → `HyperOutgoingBody` / `AxumBody::new(body)` / `body.frame().await`
-//   → `response.body().write_bytes(...)` / `response.append_trailer(...)`
-//   → shared `ArcWndBuf` read by `writer.write_response(response.clone(), ...)`
-//   → H3 DATA / trailing HEADERS
-
 async fn handle_wasm(
     State(WasmHandler { engine, component }): State<WasmHandler>,
     request: AxumRequest,
@@ -216,226 +182,157 @@ async fn handle_wasm(
     response
 }
 
-async fn serve(
-    router: Router,
-    server: h3x::H3Connection<Connection>,
-) -> (h3x::Result<()>, std::io::Result<()>) {
+async fn serve(router: Router, server: h3x::H3Connection<Connection>) -> h3x::Result<()> {
     let (writer, reader) = server.accept_bi().await.unwrap();
     let request = reader.read_request(server.qpack().clone()).await.unwrap();
     let method = request.method().clone();
-
-    let (mut parts, body) = request.into_parts();
-    let trailers = parts.extensions.remove::<Trailers>().unwrap();
-    let mut finished = false;
-    let frames = futures::stream::poll_fn(move |cx| {
-        if finished {
-            return std::task::Poll::Ready(None);
-        }
-        body.poll_read_chunk(cx, 8192).map(|result| match result {
-            Ok(chunk) if chunk.is_empty() => {
-                finished = true;
-                let trailers = trailers.headers();
-                (!trailers.is_empty()).then(|| Ok(Frame::trailers(trailers)))
-            }
-            Ok(chunk) => Some(Ok(Frame::data(chunk))),
-            Err(error) => {
-                finished = true;
-                Some(Err(error))
-            }
-        })
-    });
-    let request = http::Request::from_parts(parts, AxumBody::new(StreamBody::new(frames)));
-
-    let mut response = router.oneshot(request).await.unwrap();
+    let mut response = router.oneshot(request.map(AxumBody::new)).await.unwrap();
     let guest = response.extensions_mut().remove::<GuestTask>();
-    let (parts, mut body) = response.into_parts();
-    let mut response = Response::from_parts(parts, ArcWndBuf::new(8));
-
-    let writing = writer.write_response(response.clone(), method, server.qpack().clone());
-    let forwarding_body = async move {
-        let result = async {
-            while let Some(frame) = body.frame().await {
-                match frame
-                    .map_err(|error| std::io::Error::other(error.to_string()))?
-                    .into_data()
-                {
-                    Ok(data) => {
-                        response.body().write_bytes(data).await?;
-                        // Make the guest exercise Wasmtime's bounded output channel.
-                        tokio::time::sleep(Duration::from_millis(2)).await;
-                    }
-                    Err(frame) => {
-                        let trailers = frame
-                            .into_trailers()
-                            .map_err(|_| std::io::Error::other("unknown response frame"))?;
-                        for (name, value) in &trailers {
-                            response.append_trailer(name.clone(), value.clone());
-                        }
-                    }
-                }
-            }
-            response.shutdown().await
-        }
+    let result = writer
+        .write_response(
+            response.map(|body| body.map_err(Into::into).boxed_unsync()),
+            method,
+            server.qpack().clone(),
+        )
         .await;
-        if result.is_err() {
-            response.cancel(h3x::ErrorCode::RequestCancelled.as_u64());
-        }
-        result
-    };
-    let result = tokio::join!(writing, forwarding_body);
     if let Some(guest) = guest {
         guest.wait().await;
     }
     result
 }
 
+fn request(path: &str, source: h3x::Body) -> http::Request<h3x::Body> {
+    http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("https://example.com{path}"))
+        .body(source)
+        .unwrap()
+}
+fn upload(bytes: &'static [u8]) -> h3x::Body {
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert(
+        "x-request-trailer",
+        http::HeaderValue::from_static("preserved"),
+    );
+    StreamBody::new(futures::stream::iter([
+        Ok::<_, h3x::BoxError>(Frame::data(Bytes::from_static(bytes))),
+        Ok(Frame::trailers(trailers)),
+    ]))
+    .boxed_unsync()
+}
+
 #[tokio::test]
 async fn streams_large_bodies_and_trailers() {
-    const REQUEST_BODY: &[u8] = b"hello-hello-hello-hello-hello-hello-hello-hello";
-
     let (client, server) = connection_pair();
-    let serving = serve(fixture_router(), server);
-    let client_side = async move {
+    let client_side = async {
         let (writer, reader) = client.open_bi().await.unwrap();
-        let mut request: Request<W> = http::Request::builder()
-            .method(Method::POST)
-            .uri(format!("https://example.com{}", READ_THEN_RESPOND.path))
-            .body(ArcWndBuf::new(8))
-            .unwrap()
-            .into();
-        request.set_trailer(
-            http::HeaderName::from_static("x-request-trailer"),
-            http::HeaderValue::from_static("preserved"),
+        let request = request(
+            READ_THEN_RESPOND.path,
+            upload(b"hello-hello-hello-hello-hello-hello-hello-hello"),
         );
-
-        let sending = writer.write_request(request.clone(), client.qpack().clone());
-        let uploading = async move {
-            request.write_all(REQUEST_BODY).await?;
-            request.shutdown().await.map_err(h3x::Error::from)
-        };
-        let ((), (), mut response): ((), (), Response<R>) = tokio::try_join!(
-            sending,
-            uploading,
-            reader.read_response(Method::POST, client.qpack().clone()),
+        let ((), response) = tokio::try_join!(
+            writer.write_request(request, client.qpack().clone()),
+            reader.read_response(Method::POST, client.qpack().clone())
         )
         .unwrap();
-
         assert_eq!(response.status(), StatusCode::CREATED);
-        let mut bytes = Vec::new();
-        response.read_to_end(&mut bytes).await.unwrap();
-        assert_eq!(bytes, b"world-world-".repeat(64));
-        let trailers = response.trailers();
-        let values: Vec<_> = trailers
-            .get_all("x-response-trailer")
-            .iter()
-            .map(|value| value.to_str().unwrap())
-            .collect();
-        assert_eq!(values, ["preserved", "also-preserved"]);
+        let received = response.into_body().collect().await.unwrap();
+        assert_eq!(
+            received
+                .trailers()
+                .unwrap()
+                .get_all("x-response-trailer")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["preserved", "also-preserved"]
+        );
+        assert_eq!(received.to_bytes(), b"world-world-".repeat(64));
     };
-
-    let ((writing, forwarding_body), ()) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(serving, client_side)
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(serve(fixture_router(), server), client_side)
     })
     .await
-    .expect("streaming bodies and trailers must not stall");
-    writing.unwrap();
-    forwarding_body.unwrap();
+    .unwrap();
+    result.unwrap();
 }
 
 #[tokio::test]
 async fn sends_headers_before_request_body_finishes() {
     let (client, server) = connection_pair();
-    let serving = serve(fixture_router(), server);
-    let client_side = async move {
+    let client_side = async {
         let (writer, reader) = client.open_bi().await.unwrap();
-        let mut request: Request<W> = http::Request::builder()
-            .method(Method::POST)
-            .uri(format!("https://example.com{}", RESPOND_THEN_READ.path))
-            .body(ArcWndBuf::new(8))
-            .unwrap()
-            .into();
-        request.set_trailer(
-            http::HeaderName::from_static("x-request-trailer"),
-            http::HeaderValue::from_static("preserved"),
-        );
-
-        let uploading = tokio::spawn(writer.write_request(request.clone(), client.qpack().clone()));
-        request.write_all(b"request-").await.unwrap();
-
-        let mut response: Response<R> = tokio::time::timeout(
-            Duration::from_secs(1),
-            reader.read_response(Method::POST, client.qpack().clone()),
-        )
-        .await
-        .expect("response headers must arrive before the request body finishes")
-        .unwrap();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let source = StreamBody::new(async_stream::stream! {
+            yield Ok::<_, h3x::BoxError>(Frame::data(Bytes::from_static(b"request-")));
+            released.await.unwrap();
+            let mut rest = upload(b"body");
+            while let Some(frame) = rest.frame().await { yield frame; }
+        })
+        .boxed_unsync();
+        let sending = tokio::spawn(writer.write_request(
+            request(RESPOND_THEN_READ.path, source),
+            client.qpack().clone(),
+        ));
+        let mut response = reader
+            .read_response(Method::POST, client.qpack().clone())
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(
             response.headers()["x-handler-mode"],
             "respond-then-read-request"
         );
-
-        let mut byte = [0];
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), response.read(&mut byte))
+            tokio::time::timeout(Duration::from_millis(20), response.body_mut().frame())
                 .await
                 .is_err()
         );
-
-        request.write_all(b"body").await.unwrap();
-        request.shutdown().await.unwrap();
-        uploading.await.unwrap().unwrap();
-
-        let mut bytes = Vec::new();
-        response.read_to_end(&mut bytes).await.unwrap();
-        assert_eq!(bytes, b"request-body");
+        release.send(()).unwrap();
+        let received = response.into_body().collect().await.unwrap();
         assert_eq!(
-            response.trailers()["x-response-trailer"],
+            received.trailers().unwrap()["x-response-trailer"],
             "request-consumed"
         );
+        assert_eq!(received.to_bytes(), "request-body");
+        sending.await.unwrap().unwrap();
     };
-
-    let ((writing, forwarding_body), ()) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(serving, client_side)
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(serve(fixture_router(), server), client_side)
     })
     .await
-    .expect("response-first handling must not stall");
-    writing.unwrap();
-    forwarding_body.unwrap();
+    .unwrap();
+    result.unwrap();
 }
 
 #[tokio::test]
 async fn cancelling_response_unblocks_guest() {
     let (client, server) = connection_pair();
-    let serving = serve(fixture_router(), server);
-    let client_side = async move {
+    let client_side = async {
         let (writer, reader) = client.open_bi().await.unwrap();
-        let mut request: Request<W> = http::Request::builder()
-            .method(Method::POST)
-            .uri(format!(
-                "https://example.com{}",
-                STREAM_UNTIL_CANCELLED.path
-            ))
-            .body(ArcWndBuf::new(1))
-            .unwrap()
-            .into();
-        request.shutdown().await.unwrap();
-
-        let sending = writer.write_request(request, client.qpack().clone());
-        let receiving = reader.read_response(Method::POST, client.qpack().clone());
-        let ((), mut response): ((), Response<R>) = tokio::try_join!(sending, receiving).unwrap();
-
-        response.read_exact(&mut [0]).await.unwrap();
-        response.stop(h3x::ErrorCode::RequestCancelled.as_u64());
+        let request = request(STREAM_UNTIL_CANCELLED.path, h3x::Body::default());
+        let ((), mut response) = tokio::try_join!(
+            writer.write_request(request, client.qpack().clone()),
+            reader.read_response(Method::POST, client.qpack().clone())
+        )
+        .unwrap();
+        assert!(
+            response
+                .body_mut()
+                .frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .is_data()
+        );
+        drop(response);
     };
-
-    let ((writing, forwarding_body), ()) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(serving, client_side)
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(serve(fixture_router(), server), client_side)
     })
     .await
-    .expect("cancelling the response must unblock the guest");
-    assert!(writing.is_err());
-    assert!(forwarding_body.is_err());
+    .unwrap();
+    assert_eq!(result.unwrap_err().code, h3x::ErrorCode::NoError);
 }
 
 #[tokio::test]
@@ -444,62 +341,51 @@ async fn adapter_body_failure_cancels_output_without_poisoning_connection() {
         .route(FAILING_ADAPTER_PATH, post(failing_adapter_response))
         .route(HEALTHY_ADAPTER_PATH, post(healthy_adapter_response));
     let (client, server) = connection_pair();
-    let serving = async move {
+    let serving = async {
         let failed = serve(router.clone(), server.clone()).await;
         let healthy = serve(router, server).await;
-        (failed, healthy)
+        assert_eq!(failed.unwrap_err().code, h3x::ErrorCode::RequestCancelled);
+        healthy.unwrap();
     };
-    let client_side = async move {
-        let (writer, reader) = client.open_bi().await.unwrap();
-        let mut request: Request<W> = http::Request::builder()
-            .method(Method::POST)
-            .uri(format!("https://example.com{FAILING_ADAPTER_PATH}"))
-            .body(ArcWndBuf::new(1))
-            .unwrap()
-            .into();
-        request.shutdown().await.unwrap();
-        let ((), mut response): ((), Response<R>) = tokio::try_join!(
-            writer.write_request(request, client.qpack().clone()),
-            reader.read_response(Method::POST, client.qpack().clone()),
-        )
-        .unwrap();
-        let mut bytes = Vec::new();
-        let error = response.read_to_end(&mut bytes).await.unwrap_err();
-        assert_eq!(
-            h3x::Error::from(error).code,
-            h3x::ErrorCode::RequestCancelled
-        );
-        assert_eq!(bytes, b"partial");
-
-        let (writer, reader) = client.open_bi().await.unwrap();
-        let mut request: Request<W> = http::Request::builder()
-            .method(Method::POST)
-            .uri(format!("https://example.com{HEALTHY_ADAPTER_PATH}"))
-            .body(ArcWndBuf::new(1))
-            .unwrap()
-            .into();
-        request.shutdown().await.unwrap();
-        let ((), mut response): ((), Response<R>) = tokio::try_join!(
-            writer.write_request(request, client.qpack().clone()),
-            reader.read_response(Method::POST, client.qpack().clone()),
-        )
-        .unwrap();
-        let mut bytes = Vec::new();
-        response.read_to_end(&mut bytes).await.unwrap();
-        assert_eq!(bytes, b"healthy");
+    let client_side = async {
+        for (path, failed) in [(FAILING_ADAPTER_PATH, true), (HEALTHY_ADAPTER_PATH, false)] {
+            let (writer, reader) = client.open_bi().await.unwrap();
+            writer
+                .write_request(request(path, h3x::Body::default()), client.qpack().clone())
+                .await
+                .unwrap();
+            let response = reader
+                .read_response(Method::POST, client.qpack().clone())
+                .await;
+            if failed {
+                let error = match response {
+                    Err(error) => error,
+                    Ok(response) => *response
+                        .into_body()
+                        .collect()
+                        .await
+                        .unwrap_err()
+                        .downcast::<h3x::Error>()
+                        .unwrap(),
+                };
+                assert_eq!(error.code, h3x::ErrorCode::RequestCancelled);
+            } else {
+                assert_eq!(
+                    response
+                        .unwrap()
+                        .into_body()
+                        .collect()
+                        .await
+                        .unwrap()
+                        .to_bytes(),
+                    "healthy"
+                );
+            }
+        }
     };
-
-    let (((failed_writing, failed_forwarding), (healthy_writing, healthy_forwarding)), ()) =
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(serving, client_side)
-        })
-        .await
-        .expect("an adapter body failure must not stall or poison the connection");
-    assert!(failed_writing.is_err());
-    assert_eq!(
-        failed_forwarding.unwrap_err().to_string(),
-        "adapter body failed"
-    );
-    healthy_writing.unwrap();
-    healthy_forwarding.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(serving, client_side);
+    })
+    .await
+    .unwrap();
 }

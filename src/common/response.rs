@@ -6,12 +6,12 @@ use std::{
     task::{Context, Poll},
 };
 
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{Read, Write, trailers::Trailers};
-use crate::{ArcQpack, ArcWndBuf, ErrorCode, Result, qpack::Field};
+use crate::{ArcQpack, ArcWndBuf, Body, ErrorCode, Result, qpack::Field};
 
 /// An HTTP response and its shared streaming body.
 #[derive(Debug)]
@@ -51,6 +51,11 @@ impl<IO> Response<IO> {
 
     pub(crate) fn pseudo_headers(&self) -> [(&'static [u8], Option<&str>); 1] {
         [(b":status", Some(self.head.status.as_str()))]
+    }
+
+    /// Convert response metadata to QPACK fields.
+    pub(crate) fn fields(&self) -> Vec<Field> {
+        super::fields(self.pseudo_headers(), self.headers())
     }
 
     pub fn body(&self) -> &ArcWndBuf {
@@ -218,21 +223,20 @@ impl CancelStream for Response<Write> {
     }
 }
 
-/// Read a final HTTP/3 response from a request stream.
 pub trait ReadResponse: Sized + Send {
+    /// Read the final response, allowing request upload to continue independently.
     fn read_response(
         self,
-        request_method: Method,
+        method: http::Method,
         qpack: ArcQpack,
-    ) -> impl Future<Output = Result<Response<Read>>> + Send;
+    ) -> impl Future<Output = Result<http::Response<Body>>> + Send;
 }
 
-/// Write an HTTP/3 response to a request stream.
 pub trait WriteResponse: Sized + Send {
     fn write_response(
         self,
-        response: Response<Write>,
-        request_method: Method,
+        response: http::Response<Body>,
+        method: http::Method,
         qpack: ArcQpack,
     ) -> impl Future<Output = Result<()>> + Send;
 }

@@ -7,6 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use bytes::Bytes;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::*;
@@ -204,16 +205,20 @@ async fn message_writers_pass_owned_payload_to_transport_without_copying() {
     for response in [false, true] {
         let data = Bytes::from(vec![42; frame::MAX_DATA_CHUNK + 17]);
         let address = data.as_ptr() as usize;
-        let mut body = crate::ArcWndBuf::new(data.len());
-        body.write_bytes(data.clone()).await.unwrap();
-        body.shutdown().await.unwrap();
         let io = Io::default();
         let writes = io.writes.clone();
         let stream = H3WriteStream::new(0, io, events());
         let qpack = crate::qpack::tests::qpack();
         if response {
+            let mut body = crate::ArcWndBuf::new(data.len());
+            body.write_bytes(data.clone()).await.unwrap();
+            body.shutdown().await.unwrap();
             stream
-                .write_response(http::Response::new(body).into(), http::Method::GET, qpack)
+                .write_response(
+                    http::Response::new(window_body(body)),
+                    http::Method::GET,
+                    qpack,
+                )
                 .await
                 .unwrap();
         } else {
@@ -221,9 +226,8 @@ async fn message_writers_pass_owned_payload_to_transport_without_copying() {
                 .write_request(
                     http::Request::builder()
                         .uri("https://example.com/")
-                        .body(body)
-                        .unwrap()
-                        .into(),
+                        .body(http_body_util::Full::new(data))
+                        .unwrap(),
                     qpack,
                 )
                 .await
@@ -237,15 +241,13 @@ async fn message_writers_pass_owned_payload_to_transport_without_copying() {
 
 #[tokio::test]
 async fn message_writers_shutdown_the_underlying_send_stream() {
-    let mut request_body = crate::ArcWndBuf::new(1);
-    request_body.shutdown().await.unwrap();
-    let request: Request<crate::W> = http::Request::builder()
+    let request = http::Request::builder()
         .method(http::Method::GET)
         .uri("https://example.com/")
-        .body(request_body)
-        .unwrap()
-        .into();
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
     let request_io = Io::default();
+    let request_cancels = request_io.cancels.clone();
     let request_shutdowns = request_io.shutdowns.clone();
     let request_completed = Arc::new(AtomicUsize::new(0));
     let completed = request_completed.clone();
@@ -266,11 +268,13 @@ async fn message_writers_shutdown_the_underlying_send_stream() {
         .unwrap();
     assert_eq!(request_shutdowns.load(Ordering::SeqCst), 1);
     assert_eq!(request_completed.load(Ordering::SeqCst), 1);
+    assert!(request_cancels.lock().unwrap().is_empty());
 
     let mut response_body = crate::ArcWndBuf::new(1);
     response_body.shutdown().await.unwrap();
-    let response: Response<crate::W> = http::Response::new(response_body).into();
+    let response: http::Response<crate::Body> = http::Response::new(window_body(response_body));
     let response_io = Io::default();
+    let response_cancels = response_io.cancels.clone();
     let response_shutdowns = response_io.shutdowns.clone();
     let response_completed = Arc::new(AtomicUsize::new(0));
     let completed = response_completed.clone();
@@ -291,18 +295,18 @@ async fn message_writers_shutdown_the_underlying_send_stream() {
         .unwrap();
     assert_eq!(response_shutdowns.load(Ordering::SeqCst), 1);
     assert_eq!(response_completed.load(Ordering::SeqCst), 1);
+    assert!(response_cancels.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn body_cancellation_aborts_request_and_response_writers() {
     let request_body = crate::ArcWndBuf::new(1);
     let request_producer = request_body.clone();
-    let request: Request<crate::W> = http::Request::builder()
+    let request: http::Request<crate::Body> = http::Request::builder()
         .method(http::Method::POST)
         .uri("https://example.com/upload")
-        .body(request_body)
-        .unwrap()
-        .into();
+        .body(window_body(request_body))
+        .unwrap();
     let request_io = Io::default();
     let request_cancels = request_io.cancels.clone();
     let request_writer = tokio::spawn(
@@ -322,7 +326,7 @@ async fn body_cancellation_aborts_request_and_response_writers() {
 
     let response_body = crate::ArcWndBuf::new(1);
     let response_producer = response_body.clone();
-    let response: Response<crate::W> = http::Response::new(response_body).into();
+    let response: http::Response<crate::Body> = http::Response::new(window_body(response_body));
     let response_io = Io::default();
     let response_cancels = response_io.cancels.clone();
     let response_writer =
@@ -344,39 +348,80 @@ async fn body_cancellation_aborts_request_and_response_writers() {
 }
 
 #[tokio::test]
-async fn qpack_failure_reaches_request_and_response_producers() {
-    let qpack = crate::qpack::tests::qpack();
-    qpack.on_connection_error(ErrorCode::InternalError.connection("qpack failed"));
+async fn qpack_failure_releases_unpolled_request_and_response_sources() {
+    for response in [false, true] {
+        let qpack = crate::qpack::tests::qpack();
+        qpack.on_connection_error(ErrorCode::InternalError.connection("qpack failed"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let guard = scopeguard::guard(tx, |tx| {
+            let _ = tx.send(());
+        });
+        let source = http_body_util::StreamBody::new(futures::stream::poll_fn(move |_| {
+            let _ = &guard;
+            std::task::Poll::Pending::<
+                Option<std::result::Result<http_body::Frame<Bytes>, crate::BoxError>>,
+            >
+        }))
+        .boxed_unsync();
+        let stream = H3WriteStream::new(0, Io::default(), events());
+        let result = if response {
+            stream
+                .write_response(http::Response::new(source), http::Method::GET, qpack)
+                .await
+        } else {
+            stream
+                .write_request(http::Request::new(source), qpack)
+                .await
+        };
+        assert_eq!(result.unwrap_err().code, ErrorCode::InternalError);
+        rx.await.unwrap();
+    }
+}
 
-    let request_body = crate::ArcWndBuf::new(1);
-    let mut request_producer = request_body.clone();
-    let request: Request<crate::W> = http::Request::builder()
-        .uri("https://example.com/")
-        .body(request_body)
-        .unwrap()
-        .into();
-    let mut request_stream = H3WriteStream::new(0, Io::default(), events());
-    request_stream.cancel(ErrorCode::NoError.as_u64());
-    let error = request_stream
-        .write_request(request, qpack.clone())
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::InternalError);
-    assert_eq!(
-        Error::from(request_producer.write_all(b"x").await.unwrap_err()).code,
-        ErrorCode::InternalError
-    );
+#[tokio::test]
+async fn dropping_pending_message_releases_source_and_cancels_transport_once() {
+    for response in [false, true] {
+        let io = Io::default();
+        let cancels = io.cancels.clone();
+        let (dropped, observed) = tokio::sync::oneshot::channel();
+        let source_guard = scopeguard::guard(dropped, |tx| {
+            let _ = tx.send(());
+        });
+        let source = http_body_util::StreamBody::new(futures::stream::poll_fn(move |_| {
+            let _ = &source_guard;
+            Poll::Pending::<Option<std::result::Result<http_body::Frame<Bytes>, crate::BoxError>>>
+        }))
+        .boxed_unsync();
+        let stream = H3WriteStream::new(0, io, events());
+        let qpack = crate::qpack::tests::qpack();
+        let mut sending: Pin<Box<dyn Future<Output = crate::Result<()>>>> = if response {
+            Box::pin(stream.write_response(http::Response::new(source), http::Method::GET, qpack))
+        } else {
+            Box::pin(stream.write_request(http::Request::new(source), qpack))
+        };
+        std::future::poll_fn(|cx| {
+            assert!(sending.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(sending);
+        assert_eq!(observed.await, Ok(()));
+        assert_eq!(
+            *cancels.lock().unwrap(),
+            [ErrorCode::RequestCancelled.as_u64()]
+        );
+    }
+}
 
-    let response_body = crate::ArcWndBuf::new(1);
-    let mut response_producer = response_body.clone();
-    let response: Response<crate::W> = http::Response::new(response_body).into();
-    let error = H3WriteStream::new(0, Io::default(), events())
-        .write_response(response, http::Method::GET, qpack)
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::InternalError);
-    assert_eq!(
-        Error::from(response_producer.write_all(b"x").await.unwrap_err()).code,
-        ErrorCode::InternalError
-    );
+fn window_body(window: crate::ArcWndBuf) -> crate::Body {
+    let frames = futures::stream::try_unfold(window, |window| async move {
+        let bytes = window
+            .read_chunk(crate::frame::MAX_DATA_CHUNK)
+            .await
+            .map_err(Error::from_stream_io)?;
+        Ok::<_, Error>((!bytes.is_empty()).then(|| (http_body::Frame::data(bytes), window)))
+    });
+    http_body_util::StreamBody::new(frames)
+        .map_err(Into::into)
+        .boxed_unsync()
 }

@@ -1,22 +1,16 @@
 mod support;
 
 use std::{
-    pin::Pin,
     sync::{Arc, Mutex, OnceLock},
-    task::{Context, Poll},
     time::Duration,
 };
 
 use bytes::Bytes;
-use h3x::{
-    ArcWndBuf, R, ReadRequest, ReadResponse, Request, Response, W, WriteRequest, WriteResponse,
-};
-use http::{HeaderName, HeaderValue, Method};
-use http_body::{Body, Frame};
+use h3x::{ReadRequest, ReadResponse, WriteRequest, WriteResponse};
+use http::{HeaderValue, Method};
+use http_body::Frame;
 use http_body_util::{BodyExt, Empty};
-use qrecovery::{recv::StopSending, send::CancelStream};
 use support::{Connection, connection_pair};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wasmtime::{
     Engine, Store,
     component::{Component, Linker, ResourceTable},
@@ -34,7 +28,6 @@ use wasmtime_wasi_http::{
 
 const CHUNK_SIZE: usize = 4096;
 const CHUNKS: usize = 40;
-const CANCEL: u64 = h3x::ErrorCode::RequestCancelled.as_u64();
 
 fn fixture() -> &'static (Engine, Component) {
     static FIXTURE: OnceLock<(Engine, Component)> = OnceLock::new();
@@ -49,7 +42,7 @@ fn fixture() -> &'static (Engine, Component) {
     })
 }
 
-type UploadJob = tokio::task::JoinHandle<(h3x::Result<()>, std::io::Result<()>)>;
+type UploadJob = tokio::task::JoinHandle<h3x::Result<()>>;
 
 struct H3Hooks {
     connection: h3x::H3Connection<Connection>,
@@ -75,51 +68,23 @@ impl WasiHttpHooks for H3Hooks {
             wasmtime_wasi::runtime::spawn(async move {
                 let result = async {
                     let (writer, reader) = connection.open_bi().await.map_err(body_error)?;
-                    let (parts, mut body) = request.into_parts();
-                    let method = parts.method.clone();
-                    let mut request: Request<W> =
-                        http::Request::from_parts(parts, ArcWndBuf::new(257)).into();
-                    let sending = writer.write_request(request.clone(), connection.qpack().clone());
-                    let forwarding = async move {
-                        let result = async {
-                            while let Some(frame) = body.frame().await {
-                                let frame = frame
-                                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                                match frame.into_data() {
-                                    Ok(data) => request.body().write_bytes(data).await?,
-                                    Err(frame) => {
-                                        for (name, value) in
-                                            &frame.into_trailers().expect("body trailer frame")
-                                        {
-                                            request.append_trailer(name.clone(), value.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            request.shutdown().await
-                        }
-                        .await;
-                        if result.is_err() {
-                            request.cancel(CANCEL);
-                        }
-                        result
-                    };
-                    uploads.lock().unwrap().push(tokio::spawn(async move {
-                        tokio::join!(sending, forwarding)
-                    }));
-                    let response: Response<R> = reader
+                    let method = request.method().clone();
+                    let request = request.map(|source| {
+                        source
+                            .map_err(|error| -> h3x::BoxError {
+                                std::io::Error::other(error.to_string()).into()
+                            })
+                            .boxed_unsync()
+                    });
+                    uploads.lock().unwrap().push(tokio::spawn(
+                        writer.write_request(request, connection.qpack().clone()),
+                    ));
+                    let response = reader
                         .read_response(method, connection.qpack().clone())
                         .await
                         .map_err(body_error)?;
-                    let (parts, body) = response.into_parts();
-                    let response = Response::from_parts(parts.clone(), body);
-                    let body = H3ResponseBody {
-                        response,
-                        finished: false,
-                    }
-                    .boxed_unsync();
                     Ok(IncomingResponse {
-                        resp: http::Response::from_parts(parts, body),
+                        resp: response.map(|source| source.map_err(body_error).boxed_unsync()),
                         worker: None,
                         between_bytes_timeout: config.between_bytes_timeout,
                     })
@@ -128,48 +93,6 @@ impl WasiHttpHooks for H3Hooks {
                 Ok(result)
             }),
         ))
-    }
-}
-
-// Dropping a WASI incoming body must stop its H3 stream, even if EOF was never
-// polled. Reading EOF exposes trailers exactly once.
-struct H3ResponseBody {
-    response: Response<R>,
-    finished: bool,
-}
-
-impl Body for H3ResponseBody {
-    type Data = Bytes;
-    type Error = types::ErrorCode;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        if self.finished {
-            return Poll::Ready(None);
-        }
-        match self.response.body().poll_read_chunk(cx, 4096) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => {
-                self.finished = true;
-                Poll::Ready(Some(Err(body_error(error))))
-            }
-            Poll::Ready(Ok(chunk)) if chunk.is_empty() => {
-                self.finished = true;
-                let trailers = self.response.trailers();
-                Poll::Ready((!trailers.is_empty()).then(|| Ok(Frame::trailers(trailers))))
-            }
-            Poll::Ready(Ok(chunk)) => Poll::Ready(Some(Ok(Frame::data(chunk)))),
-        }
-    }
-}
-
-impl Drop for H3ResponseBody {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.response.stop(CANCEL);
-        }
     }
 }
 
@@ -247,28 +170,26 @@ async fn guest(client: h3x::H3Connection<Connection>, path: &str) {
         "scenario and healthy follow-up must both use h3x"
     );
     for (index, job) in jobs.into_iter().enumerate() {
-        let (writing, forwarding) = job.await.unwrap();
+        let writing = job.await.unwrap();
         if index == 0 && path.starts_with("/stopped-no-error/") {
             assert_eq!(writing.unwrap_err().code, h3x::ErrorCode::NoError);
-            assert_eq!(
-                h3x::Error::from(forwarding.unwrap_err()).code,
-                h3x::ErrorCode::NoError
-            );
         } else if index == 0 && (path.starts_with("/abort/") || path.starts_with("/stopped/")) {
             assert!(writing.is_err());
-            assert!(forwarding.is_err());
         } else {
             writing.unwrap();
-            forwarding.unwrap();
         }
     }
 }
 
 async fn serve_one(server: &h3x::H3Connection<Connection>, path: &str) {
     let modes: Vec<_> = path.trim_start_matches('/').split('/').collect();
-    let (upload, download, order) = (modes[0], modes[1], modes[2]);
+    let (upload, download, order) = (
+        modes[0].to_owned(),
+        modes[1].to_owned(),
+        modes[2].to_owned(),
+    );
     let (writer, reader) = server.accept_bi().await.unwrap();
-    let mut request = reader.read_request(server.qpack().clone()).await.unwrap();
+    let request = reader.read_request(server.qpack().clone()).await.unwrap();
     assert_eq!(
         request.method(),
         if download == "head" {
@@ -298,123 +219,120 @@ async fn serve_one(server: &h3x::H3Connection<Connection>, path: &str) {
         );
     }
     let method = request.method().clone();
-    let mut response: Response<W> = http::Response::builder()
-        .status(if download == "no-content" { 204 } else { 200 })
-        .header("x-server", "h3x")
-        .body(ArcWndBuf::new(257))
-        .unwrap()
-        .into();
-    if download == "fixed" || download == "head" {
-        response.set_header(
-            http::header::CONTENT_LENGTH,
-            HeaderValue::from_str(&(CHUNK_SIZE * CHUNKS).to_string()).unwrap(),
-        );
-    }
-    let (consumed, consumption) = tokio::sync::oneshot::channel();
+    let (consumed, consumption) =
+        tokio::sync::oneshot::channel::<Result<Option<h3x::Body>, h3x::BoxError>>();
+    let read_upload = upload.clone();
+    let duplex = order == "duplex";
     let reading = async move {
-        if upload == "stopped" || upload == "stopped-no-error" {
-            request.read_exact(&mut [0]).await.unwrap();
-            request.stop(if upload == "stopped-no-error" {
-                h3x::ErrorCode::NoError.as_u64()
+        let mut source = request.into_body();
+        let result = if read_upload == "stopped" || read_upload == "stopped-no-error" {
+            assert!(source.frame().await.unwrap().unwrap().is_data());
+            drop(source);
+            if read_upload == "stopped" {
+                Err(std::io::Error::other("server cancelled upload").into())
             } else {
-                CANCEL
-            });
-        } else if order != "duplex" {
-            let mut bytes = Vec::new();
-            let result = request.read_to_end(&mut bytes).await;
-            if upload == "abort" {
-                assert_eq!(
-                    h3x::Error::from(result.unwrap_err()).code,
-                    h3x::ErrorCode::RequestCancelled
-                );
-            } else {
-                result.unwrap();
-                let expected = match upload {
-                    "small" => b"request".to_vec(),
-                    "stream" | "fixed" | "trailers" => vec![b'q'; CHUNK_SIZE * CHUNKS],
-                    _ => Vec::new(),
-                };
-                assert_eq!(bytes, expected);
-                let trailers = request.trailers();
-                if upload == "trailers" || upload == "trailers-only" {
+                Ok(None)
+            }
+        } else if duplex {
+            Ok(Some(source))
+        } else {
+            match source.collect().await {
+                Err(error) => {
+                    assert_eq!(read_upload, "abort");
                     assert_eq!(
-                        trailers
-                            .get_all("x-upload-trailer")
-                            .iter()
-                            .map(|v| v.to_str().unwrap())
-                            .collect::<Vec<_>>(),
-                        ["one", "two"]
+                        error.downcast_ref::<h3x::Error>().unwrap().code,
+                        h3x::ErrorCode::RequestCancelled
                     );
-                } else {
-                    assert!(trailers.is_empty());
+                    Err(error)
+                }
+                Ok(received) => {
+                    if read_upload == "trailers" || read_upload == "trailers-only" {
+                        assert_eq!(
+                            received
+                                .trailers()
+                                .unwrap()
+                                .get_all("x-upload-trailer")
+                                .iter()
+                                .map(|v| v.to_str().unwrap())
+                                .collect::<Vec<_>>(),
+                            ["one", "two"]
+                        );
+                    } else {
+                        assert!(received.trailers().is_none());
+                    }
+                    let expected = match read_upload.as_str() {
+                        "small" => b"request".to_vec(),
+                        "stream" | "fixed" | "trailers" => vec![b'q'; CHUNK_SIZE * CHUNKS],
+                        _ => Vec::new(),
+                    };
+                    assert_eq!(received.to_bytes(), expected);
+                    Ok(None)
                 }
             }
-        }
-        consumed.send(request).ok();
+        };
+        let _ = consumed.send(result);
     };
-    let writing = async {
-        // Normal responses cannot send headers until EOF; early and duplex
-        // responses must send headers before the guest produces its body.
+    let writing = async move {
+        let mut response = http::Response::builder()
+            .status(if download == "no-content" { 204 } else { 200 })
+            .header("x-server", "h3x");
+        if download == "fixed" || download == "head" {
+            response = response.header(
+                http::header::CONTENT_LENGTH,
+                (CHUNK_SIZE * CHUNKS).to_string(),
+            );
+        }
         let mut consumption = Some(consumption);
-        let request = if order == "normal" {
+        let ready = if order == "normal" {
             Some(consumption.take().unwrap().await.unwrap())
         } else {
             None
         };
-        let sending = writer.write_response(response.clone(), method, server.qpack().clone());
-        let producing = async move {
-            if order == "early" {
-                consumption.take().unwrap().await.unwrap();
-            }
-            if order == "duplex" {
-                let mut request = match request {
-                    Some(r) => r,
-                    None => consumption.take().unwrap().await.unwrap(),
-                };
-                for _ in 0..CHUNKS {
-                    let mut chunk = vec![0; CHUNK_SIZE];
-                    request.read_exact(&mut chunk).await.unwrap();
-                    assert_eq!(chunk, vec![b'q'; CHUNK_SIZE]);
-                    response.write_all(&chunk).await.unwrap();
+        let fails =
+            download == "cancel" || download == "reset" || upload == "abort" || upload == "stopped";
+        let frames = async_stream::try_stream! {
+            let request = match ready {
+                Some(result) => result?,
+                None => consumption.take().unwrap().await.unwrap()?,
+            };
+            if let Some(mut source) = request {
+                let mut count = 0;
+                while let Some(frame) = source.frame().await {
+                    let data = frame?.into_data().expect("duplex DATA");
+                    assert!(data.iter().all(|&byte| byte == b'q'));
+                    count += data.len();
+                    yield Frame::data(data);
                 }
-                assert_eq!(request.read(&mut [0]).await.unwrap(), 0);
-            } else if download == "cancel" || upload == "abort" || upload == "stopped" {
-                loop {
-                    if let Err(error) = response.write_all(&[b'r'; CHUNK_SIZE]).await {
-                        assert_eq!(
-                            h3x::Error::from(error).code,
-                            h3x::ErrorCode::RequestCancelled
-                        );
-                        return;
-                    }
-                }
+                assert_eq!(count, CHUNK_SIZE * CHUNKS);
+            } else if download == "cancel" {
+                loop { yield Frame::data(Bytes::from(vec![b'r'; CHUNK_SIZE])); }
             } else if download == "reset" {
-                response.write_all(b"partial").await.unwrap();
-                response.cancel(CANCEL);
-                return;
+                yield Frame::data(Bytes::from_static(b"partial"));
+                Err::<(), h3x::BoxError>(std::io::Error::other("server reset response").into())?;
             } else {
-                match download {
-                    "small" => response.write_all(b"response").await.unwrap(),
+                match download.as_str() {
+                    "small" => { yield Frame::data(Bytes::from_static(b"response")); }
                     "stream" | "fixed" | "trailers" => {
-                        for _ in 0..CHUNKS {
-                            response.write_all(&[b'r'; CHUNK_SIZE]).await.unwrap();
-                        }
+                        for _ in 0..CHUNKS { yield Frame::data(Bytes::from(vec![b'r'; CHUNK_SIZE])); }
                     }
                     _ => {}
                 }
             }
             if download == "trailers" || download == "trailers-only" {
-                for value in ["one", "two"] {
-                    response.append_trailer(
-                        HeaderName::from_static("x-download-trailer"),
-                        HeaderValue::from_static(value),
-                    );
-                }
+                let mut trailers = http::HeaderMap::new();
+                for value in ["one", "two"] { trailers.append("x-download-trailer", HeaderValue::from_static(value)); }
+                yield Frame::trailers(trailers);
             }
-            response.shutdown().await.unwrap();
         };
-        let (result, ()) = tokio::join!(sending, producing);
-        if download == "cancel" || download == "reset" || upload == "abort" || upload == "stopped" {
+        let source: h3x::Body = http_body_util::StreamBody::new(frames).boxed_unsync();
+        let result = writer
+            .write_response(
+                response.body(source).unwrap(),
+                method,
+                server.qpack().clone(),
+            )
+            .await;
+        if fails {
             assert!(result.is_err());
         } else {
             result.unwrap();

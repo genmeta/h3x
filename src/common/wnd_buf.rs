@@ -96,7 +96,7 @@ impl AsyncWrite for WndBuf {
         if self.fin {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
-        let len = buf.len().min(self.capacity - self.len);
+        let len = buf.len().min(self.capacity.saturating_sub(self.len));
         if len == 0 {
             self.write_waker = Some(cx.waker().clone());
             return Poll::Pending;
@@ -142,8 +142,20 @@ impl std::fmt::Debug for ArcWndBuf {
 
 impl ArcWndBuf {
     pub fn new(capacity: usize) -> Self {
+        Self::with_initial(capacity, Bytes::new())
+    }
+
+    /// Start with owned bytes without copying or waiting for a consumer.
+    /// Initial bytes may exceed capacity; further writes wait until the queued
+    /// bytes fall below capacity. Capacity bounds subsequent streaming writes.
+    pub fn with_initial(capacity: usize, initial: Bytes) -> Self {
+        let mut window = WndBuf::with_capacity(capacity);
+        if !initial.is_empty() {
+            window.len = initial.len();
+            window.chunks.push_back(initial);
+        }
         Self {
-            window: Arc::new(Mutex::new(Ok(WndBuf::with_capacity(capacity)))),
+            window: Arc::new(Mutex::new(Ok(window))),
             error_cb: Arc::new(Mutex::new(None)),
         }
     }
@@ -199,7 +211,7 @@ impl ArcWndBuf {
             if window.fin {
                 return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
             }
-            let count = bytes.len().min(window.capacity - window.len);
+            let count = bytes.len().min(window.capacity.saturating_sub(window.len));
             if count == 0 {
                 window.write_waker = Some(cx.waker().clone());
                 return Poll::Pending;

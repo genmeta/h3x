@@ -12,7 +12,7 @@ use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{Read, Write, trailers::Trailers};
-use crate::{ArcQpack, ArcWndBuf, ErrorCode, Result, qpack::Field};
+use crate::{ArcQpack, ArcWndBuf, Body, ErrorCode, Result, qpack::Field};
 
 /// An HTTP request and its shared streaming body.
 #[derive(Debug)]
@@ -90,6 +90,11 @@ impl<IO> Request<IO> {
             ),
             (b":protocol", self.protocol()),
         ]
+    }
+
+    /// Convert request metadata to QPACK fields.
+    pub(crate) fn fields(&self) -> Vec<Field> {
+        super::fields(self.pseudo_headers(), self.headers())
     }
 
     pub fn body(&self) -> &ArcWndBuf {
@@ -344,16 +349,20 @@ impl CancelStream for Request<Write> {
     }
 }
 
-/// Read an HTTP/3 request from a request stream.
 pub trait ReadRequest: Sized + Send {
-    fn read_request(self, qpack: ArcQpack) -> impl Future<Output = Result<Request<Read>>> + Send;
+    fn read_request(
+        self,
+        qpack: ArcQpack,
+    ) -> impl Future<Output = Result<http::Request<Body>>> + Send;
 }
 
-/// Write an HTTP/3 request to a request stream.
-pub trait WriteRequest: Sized + Send {
+/// Send a request with any `http_body::Body<Data = Bytes>` or a shared body window.
+/// `http_body_util::Empty<Bytes>` sends headers and finishes the write direction.
+/// Standard bodies are consumed directly, including bodies that are not `Unpin`.
+pub trait WriteRequest<B = Body>: Sized + Send {
     fn write_request(
         self,
-        request: Request<Write>,
+        request: http::Request<B>,
         qpack: ArcQpack,
     ) -> impl Future<Output = Result<()>> + Send;
 }

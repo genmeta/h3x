@@ -14,23 +14,17 @@ pub struct Trailers {
 }
 
 impl Trailers {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn headers(&self) -> HeaderMap {
         self.lock().clone()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
-    }
-
-    pub(crate) fn set(&self, name: HeaderName, value: HeaderValue) {
+    /// Replace a trailer field. Set outgoing fields before body shutdown.
+    pub fn set(&self, name: HeaderName, value: HeaderValue) {
         self.lock().insert(name, value);
     }
 
-    pub(crate) fn append(&self, name: HeaderName, value: HeaderValue) {
+    /// Append a trailer value. Set outgoing fields before body shutdown.
+    pub fn append(&self, name: HeaderName, value: HeaderValue) {
         self.lock().append(name, value);
     }
 
