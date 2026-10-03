@@ -76,26 +76,6 @@ impl<T> ArcH3Stream<T> {
         }
         true
     }
-
-    /// Complete this direction normally and release its transport I/O.
-    pub(crate) fn finish(&self) -> bool {
-        let mut state = self.0.lock().unwrap();
-        let Ok(stream) = state.as_mut() else {
-            return false;
-        };
-        match mem::replace(stream, H3Stream::Transition) {
-            H3Stream::Idle(io) | H3Stream::Polling(io, _) => {
-                drop(io);
-                *stream = H3Stream::Finished;
-                true
-            }
-            H3Stream::Finished => {
-                *stream = H3Stream::Finished;
-                false
-            }
-            H3Stream::Transition => unreachable!(),
-        }
-    }
 }
 
 #[cfg(test)]

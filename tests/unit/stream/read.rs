@@ -8,6 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use http_body::Body as _;
 use qbase::varint::{VarInt, WriteVarInt};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
@@ -443,7 +444,7 @@ async fn read_request_rejects_a_stream_without_initial_headers() {
             }
         }),
     );
-    let result: crate::Result<crate::Request<crate::R>> =
+    let result: crate::Result<http::Request<crate::Body>> =
         stream.read_request(crate::qpack::tests::qpack()).await;
     let Err(error) = result else {
         panic!("a message without HEADERS must fail")
@@ -526,7 +527,7 @@ async fn short_data_reads_share_a_slab_without_window_copies() {
             },
             events(),
         );
-        let body = if response {
+        let mut body = if response {
             stream
                 .read_response(http::Method::GET, qpack)
                 .await
@@ -537,11 +538,8 @@ async fn short_data_reads_share_a_slab_without_window_copies() {
         };
         // Retain all chunks so the allocator cannot reuse a freed address.
         let mut chunks = Vec::new();
-        loop {
-            let chunk = body.read_chunk(64).await.unwrap();
-            if chunk.is_empty() {
-                break;
-            }
+        while let Some(frame) = body.frame().await {
+            let chunk = frame.unwrap().into_data().unwrap();
             assert_eq!(&chunk[..], &[42]);
             chunks.push(chunk);
         }
@@ -589,14 +587,72 @@ async fn cancelling_request_body_stops_the_pending_transport_read() {
         },
         events(),
     );
-    let mut request = stream.read_request(qpack).await.unwrap();
-    request.stop(ErrorCode::RequestCancelled.as_u64());
+    let state = stream.state.clone();
+    let request = stream.read_request(qpack).await.unwrap();
+    drop(request);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while stops.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(&*stops.lock().unwrap(), &[ErrorCode::NoError.as_u64()]);
     assert_eq!(
-        &*stops.lock().unwrap(),
-        &[ErrorCode::RequestCancelled.as_u64()]
+        state.0.lock().unwrap().as_ref().err().unwrap().code,
+        ErrorCode::NoError
     );
-    assert_eq!(
-        Error::from(request.read(&mut [0]).await.unwrap_err()).code,
-        ErrorCode::RequestCancelled
+}
+
+#[tokio::test]
+async fn inbound_body_transfers_bytes_without_copy_and_preserves_eof() {
+    let native = crate::ArcWndBuf::new(crate::frame::MAX_DATA_CHUNK);
+    let data = Bytes::from_static(b"shared body bytes");
+    native.write_bytes(data.clone()).await.unwrap();
+    native.clone().shutdown().await.unwrap();
+
+    let (lifetime, _dropped) = tokio::sync::oneshot::channel();
+    let mut body = incoming_body(native.clone(), crate::Trailers::default(), lifetime);
+    let received = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(received, data);
+    assert_eq!(received.as_ptr(), data.as_ptr());
+    assert!(body.frame().await.is_none());
+    drop(body);
+    assert!(
+        native
+            .read_chunk(crate::frame::MAX_DATA_CHUNK)
+            .await
+            .unwrap()
+            .is_empty()
     );
+}
+
+#[tokio::test]
+async fn body_owns_the_drop_signal_before_and_after_its_first_poll() {
+    for polled in [false, true] {
+        let native = crate::ArcWndBuf::new(crate::frame::MAX_DATA_CHUNK);
+        let (lifetime, mut dropped) = tokio::sync::oneshot::channel();
+        let mut body = incoming_body(native.clone(), crate::Trailers::default(), lifetime);
+        if polled {
+            std::future::poll_fn(|cx| {
+                assert!(Pin::new(&mut body).poll_frame(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(
+            dropped.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        drop(body);
+        assert_eq!(
+            dropped.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        );
+        // The lifetime signal does not change the byte buffer itself.
+        native
+            .write_bytes(Bytes::from_static(b"still a buffer"))
+            .await
+            .unwrap();
+    }
 }

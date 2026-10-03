@@ -17,9 +17,7 @@ fn stream_state_retains_normal_and_failed_terminal_states() {
     let polling = ArcH3Stream(Arc::new(Mutex::new(Ok(H3Stream::Polling(3, waker)))));
     assert!(polling.fail(error.clone(), |io| *io += 1));
 
-    let finished = ArcH3Stream::new(7);
-    assert!(finished.finish());
-    assert!(!finished.finish());
+    let finished: ArcH3Stream<u8> = ArcH3Stream(Arc::new(Mutex::new(Ok(H3Stream::Finished))));
     assert!(matches!(
         *finished.0.lock().unwrap(),
         Ok(H3Stream::Finished)

@@ -30,8 +30,10 @@ background bidirectional stream queue.
 
 Read and write handles own only their direction's state:
 `H3ReadStream<R>` and `H3WriteStream<W>`. The connection stores a registered handle for each direction, sharing its state
-with the application handle. Dropping an application handle removes its registration
-without explicitly cancelling transport I/O. Read and write directions are registered independently in `BiStreams` and removed
+with the application handle. Dropping an unfinished read handle sends STOP_SENDING;
+dropping an unfinished write handle sends RESET_STREAM. Both use
+`H3_REQUEST_CANCELLED` and remove the affected stream registrations. Handles that
+already reached EOF/FIN or an error do not cancel again. Read and write directions are registered independently in `BiStreams` and removed
 immediately by completion callbacks on terminal I/O, cancellation, or handle drop.
 Draining waits until both registries are empty. `BiStreams` owns the drain
 notification; application handles only carry a completion callback and keep
@@ -67,7 +69,7 @@ affected requests. A managing `Pool` removes that connection from reuse.
 
 Peer STOP/reset errors are observed through transport write, flush, or shutdown.
 There is no independent STOP notification input while waiting for body data.
-Applications finish or cancel outgoing bodies and stop incoming bodies explicitly.
+Applications finish or abort write futures and drop unused incoming bodies.
 Stream termination wakes pending network I/O and connection drain waiters;
 tasks waiting for body data or buffer space resume when the application advances
 or cancels the body.
@@ -104,141 +106,101 @@ The pool does not send or automatically retry requests; after `get`, use `connec
 
 ## Request and Response I/O
 
-Construct outgoing messages with `http::Request::builder()` and
-`http::Response::builder()`, then convert them with `.into()`. Request and
-response metadata is exposed through inherent methods. Outgoing values also have
-inherent setters; request setters accept a parsed `http::Uri` and `http::Method`.
+Request writing accepts `http::Request<B>` with a standard HTTP body.
+Read operations return `http::Request<Body>` or `http::Response<Body>`, and response
+writing accepts `http::Response<Body>`. `h3x::Body` is an
+`UnsyncBoxBody<Bytes, BoxError>`; use `BodyExt::map_err` and `boxed_unsync` when
+preparing a response body. An existing `h3x::Body` can be passed directly.
 
 ```rust
-use h3x::ArcWndBuf;
-use h3x::{Request, Response, W};
+use bytes::Bytes;
+use h3x::Body;
+use http_body_util::{Empty, Full};
 
-let mut request: Request<W> = http::Request::builder()
+let request = http::Request::builder()
     .method(http::Method::POST)
     .uri("https://example.com/upload")
-    .version(http::Version::HTTP_3)
-    .body(ArcWndBuf::new(8192))?
-    .into();
-request.set_method(http::Method::PUT);
-assert_eq!(request.method(), http::Method::PUT);
-
-let mut response: Response<W> = http::Response::builder()
-    .version(http::Version::HTTP_3)
-    .body(ArcWndBuf::new(8192))?
-    .into();
-response.set_status(http::StatusCode::CREATED);
-assert_eq!(response.status(), http::StatusCode::CREATED);
+    .body(Full::new(Bytes::from_static(b"hello")))?;
+let empty_request = http::Request::builder()
+    .uri("https://example.com/")
+    .body(Empty::<Bytes>::new())?;
+let response: http::Response<Body> = http::Response::new(Body::default());
 # Ok::<(), http::Error>(())
 ```
 
-Use `WndBuf` as the builder's body for streaming requests and responses. Before
-handing a value to its stream writer, clone `request.body()` or `response.body()`
-when another future will produce a streaming body. Converting back to
-`http::Request` / `http::Response` preserves metadata and the shared body.
-The public `into_parts` and `from_parts` methods transfer message metadata and
-body ownership without copying them, including through host adapters.
+Applications configure metadata with the standard HTTP APIs. Custom `Request<R/W>`,
+`Response<R/W>` and shared `Trailers` are no longer public message types.
 
-The four protocol I/O traits live on the stream directions. Responses take the
-original request method so HEAD and CONNECT response semantics can be applied:
-
-```rust,ignore
-use h3x::{ReadRequest, ReadResponse, WriteRequest, WriteResponse};
-
-let incoming_request = rs.read_request(qpack.clone()).await?;
-let request_method = incoming_request.method().clone();
-ws.write_response(outgoing_response, request_method, qpack.clone()).await?;
-
-ws.write_request(outgoing_request, qpack.clone()).await?;
-let incoming_response = rs.read_response(method, qpack).await?;
-```
-
-Each write future encodes metadata, sends HEADERS and DATA, and finishes its
-transport direction. Drive writing, streaming production, and response reception
-concurrently. No upload task is started implicitly by a stream writer. Failures
-are returned directly and wake streaming producers with the same error.
-
-`Request` and `Response` store an `ArcWndBuf` directly (also exported as
-`WndBuf`). `Request<R>` and `Response<R>` implement Tokio `AsyncRead`;
-`Request<W>` and `Response<W>` implement Tokio `AsyncWrite`.
+`write_request` is generic over `B: http_body::Body<Data = Bytes> + Send`, with
+`B::Error: Into<BoxError>`. Pass `Empty<Bytes>`, `Full<Bytes>`, `StreamBody`, or an
+existing boxed `Body` directly. The source is pinned inside the write future, so
+it does not need `Unpin`. Empty bodies send headers and finish the write direction.
+An existing `WndBuf` has a separate implementation that consumes its shared
+window directly.
 
 ```rust,ignore
-use tokio::io::AsyncReadExt;
+use h3x::{ReadRequest, WriteResponse};
+use http_body_util::BodyExt;
 
-let mut bytes = Vec::new();
-response.read_to_end(&mut bytes).await?;
+let request = reader.read_request(connection.qpack().clone()).await?;
+let method = request.method().clone();
+let response = router.oneshot(request.map(axum::body::Body::new)).await?;
+writer
+    .write_response(
+        response.map(|body| body.map_err(Into::into).boxed_unsync()),
+        method,
+        connection.qpack().clone(),
+    )
+    .await?;
 ```
 
-Messages also contain shared `Trailers` storage. Outgoing `Request<W>` and
-`Response<W>` values can be cloned: their initial metadata is copied while the
-body and trailers remain shared. Set or append every outgoing trailer before
-shutting down the body. The stream writer drains DATA, reads the trailers after
-body EOF, sends a trailing HEADERS frame when they are non-empty, and then sends
-FIN.
+Read operations return after headers. DATA, trailers, EOF and subsequent errors
+are delivered through `BodyExt::frame` or `BodyExt::collect`:
 
 ```rust,ignore
-let outgoing = request.clone();
-let writing = tokio::spawn(stream.write_request(outgoing, qpack));
+use http_body_util::BodyExt;
 
-request.write_all(payload).await?;
-request.set_trailer(
-    http::HeaderName::from_static("x-checksum"),
-    http::HeaderValue::from_static("ok"),
-);
-request.shutdown().await?;
-writing.await??;
+let collected = response.into_body().collect().await?;
+let trailers = collected.trailers();
+let bytes = collected.to_bytes();
 ```
 
-For incoming messages, drain the body to EOF before reading the synchronous
-trailer snapshot:
+To produce trailers, use a `StreamBody` of `Frame::data` values followed by one
+`Frame::trailers` and EOF. h3x preserves duplicate fields and sensitive flags.
+Frames after trailers are rejected as a local source error. HEAD/204/304 response
+sources are dropped without polling. Responses still take the request method.
 
-```rust,ignore
-let mut bytes = Vec::new();
-response.read_to_end(&mut bytes).await?;
-let trailers = response.trailers();
-```
+### Buffering and ownership
 
-ArcWndBuf clones share the buffer.
-For adapters that already own `bytes::Bytes`, use
-`body.write_bytes(bytes).await` and `body.read_chunk(limit).await` (or
-`poll_read_chunk`) to transfer payload ownership without copying through the
-window. An empty read chunk means EOF; `limit` must be nonzero. Chunk boundaries
-are not message or HTTP/3 frame boundaries. The existing `AsyncRead` and
-`AsyncWrite` interfaces remain available and may be mixed with chunk I/O;
-borrowed writes copy into a coalescing buffer and borrowed reads copy out.
-Both interfaces share one pending reader and one pending writer, the byte
-capacity, EOF, and cancellation state.
+Bounded windows remain inside h3x: received DATA uses an 8 KiB window and outgoing
+Body frames feed a 64 KiB window. The receive task starts after headers. Writers
+poll body production and encoding concurrently within the write future, without
+spawning an extra producer task. A full window pauses its producer.
 
-The receive task reads DATA into owned chunks, and the send task passes chunk
-slices directly to the transport, capped at the normal DATA frame size. WASI
-HTTP adapters can pass `Frame<Bytes>` payloads through the same chunk API without
-an intermediate byte buffer. This removes host-side body staging copies, not
-copies in the QUIC implementation or across the Wasm linear-memory boundary.
-Capacity limits queued payload bytes, not backing allocations: a small `Bytes`
-slice can retain its larger allocation, and chunks retained by consumers are
-outside the queue budget. Use reasonably sized source allocations for strict
-memory budgets. Like `write_all`, cancelling `write_bytes` can leave an accepted
-prefix queued; `poll_write_bytes` advances a caller-owned `Bytes` only by the
-accepted prefix for callers that need resumable writes.
+Window chunk transfers share `Bytes` payloads without copying them. Capacity
+bounds queued bytes, not backing allocations or data retained by the application.
+QUIC and Wasm memory copies are separate from these window transfers.
+`ArcWndBuf`/`WndBuf` remain available as byte-buffer utilities; applications do
+not need them to send or receive HTTP messages.
 
-Use Tokio's `AsyncReadExt` / `AsyncWriteExt` directly with ArcWndBuf. Call
-`shutdown().await` on the producer to finish production. The polled write future
-drains the buffer and sends FIN. Use `stop(code)` or `cancel(code)` on the window
-to cancel reception or sending. The directional messages expose the same
-operations: `Request<R>` / `Response<R>` implement `StopSending`, while
-`Request<W>` / `Response<W>` implement `CancelStream`. Host adapters should use
-the message-level operation. Cloning or dropping a window does not implicitly
-finish or cancel it.
+Dropping an incoming Body closes a local oneshot sender captured by its frame
+stream. The background receive task waits on that receiver alongside its I/O and
+stops reception with `H3_NO_ERROR` when the Body is abandoned, allowing an early
+response to proceed. The channel carries only lifetime notification; all payload
+bytes still use WndBuf. Window clones have no drop policy.
 
-For incoming ArcWndBuf bodies, a receive task starts after headers are parsed.
-A full window pauses network reads; consuming bytes resumes them. Valid transport
-EOF finishes the buffer, leaving unread bytes available. Errors reach waiting
-readers through the window, and cancellation wakes the receive task even while
-it is waiting for network input or space.
+Read and write handles both cancel unfinished work in `Drop`, using their existing
+terminal state. This also covers message futures that are never polled; there are
+no per-handle cancellation flags or scope guards. Raw I/O users must finish the
+needed direction explicitly: discarding an unfinished handle now means cancelling
+it, not merely removing its registration. Source errors retain their original cause.
+The application still owns the relationship between upload and response lifetimes.
 
-All incoming messages return after final HEADERS with an ArcWndBuf body.
-DATA, trailers, and FIN are processed by the receive task; subsequent errors
-are reported when reading the body. Content-Length does not select body storage.
-The sender still checks declared lengths while streaming.
+Drive request writing concurrently with response reading so early response
+headers do not wait for upload EOF. For example, spawn the write future and keep
+its JoinHandle; finish or abort it as required by the application's exchange
+lifecycle. Peer stop/reset is observed on subsequent transport I/O; the transport
+interface has no independent stop subscription while a source remains Pending.
 
 ## Errors
 
@@ -246,8 +208,8 @@ The sender still checks declared lengths while streaming.
 descriptive `reason`. Use `error.code` for protocol decisions and `error.reason`
 for diagnostics. Its `Stream` and `Connection` variants specify whether handling
 the error aborts one request or the entire HTTP/3 connection. Error construction
-requires this scope to be selected explicitly. Underlying error details are included
-in `reason`; there is no source chain. Streams retain raw I/O errors until a protocol
+requires this scope to be selected explicitly. Outgoing Body failures retain their original error through `Error::source`;
+protocol failures keep their descriptive `reason`. Streams retain raw I/O errors until a protocol
 boundary classifies them. Wrapping an `Error` in `io::Error` preserves its scope,
 protocol code, and reason.
 
@@ -275,25 +237,16 @@ h3x uses exactly these server-initiated bidirectional streams so that the "serve
 
 Extended CONNECT support is enabled and advertised automatically by both
 `Settings::default()` and `Settings::new(...)`; no opt-in is required.
-For CONNECT, drive `write_request` concurrently with response reception and keep
-the request body window empty until `read_response` returns a successful response.
-The writer flushes HEADERS before waiting for body data. The caller controls
-handshake acceptance, rejection, and cancellation; on rejection cancel the
-retained request body producer. Extended CONNECT assumes peer support without
-waiting for peer SETTINGS.
+For CONNECT, drive `write_request` concurrently with response reception and use
+a streaming Body whose data producer can wait for the successful response.
+The caller controls acceptance, rejection and cancellation. Abort the send future
+and drop the response Body when abandoning the exchange. Extended CONNECT assumes
+peer support without waiting for peer SETTINGS.
 
-The server uses `read_request` for both ordinary HTTP and CONNECT and branches
-on `request.method()`. Send a 2xx response with `write_response` to accept a tunnel,
-passing `Method::CONNECT` and omitting Content-Length. Drive writing
-concurrently with body production and request reception. Stop the incoming body
-and cancel the retained producer when abandoning an exchange.
-
-There is no separate `Tunnel` type. Use `into_body()` to extract the ArcWndBuf. It implements Tokio `AsyncRead` and `AsyncWrite`, so
-the tunnel directions can use Tokio copy helpers or application codecs directly.
-`shutdown()` finishes production; the sender drains buffered DATA and sends FIN.
-`flush()` exposes buffered bytes without waiting for transport delivery.
-`cancel(code)` cancels sending and `stop(code)` cancels receiving; dropping a
-window alone has no implicit cancellation behavior.
+The server branches on `request.method()` and sends a 2xx response to accept a
+tunnel, passing `Method::CONNECT`. Both directions carry ordinary Body DATA frames.
+An application can bridge AsyncRead/AsyncWrite with a streaming producer and
+consumer at its own boundary. There is no separate Tunnel type.
 
 CONNECT preserves all DATA payload bytes, including WebSocket masks,
 fragmentation, and negotiated compression. Unknown frames are skipped; trailing
@@ -307,14 +260,9 @@ relay timeouts belong to the proxy/application. No WebSocket message codec is
 included. See [RFC 9220](https://www.rfc-editor.org/rfc/rfc9220.html) and
 [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.4).
 
-ArcWndBuf cancellation uses `qrecovery::recv::StopSending` and
-`qrecovery::send::CancelStream`: import the trait and call `stop(code)` on an
-incoming body or `cancel(code)` on an outgoing streaming body. Both are synchronous;
-the callback forwards the supplied code to both transport directions and cancels
-the request's QPACK state. Unknown codes are mapped to `InternalError`.
-
 Extended CONNECT stores `:protocol` as an `Arc<str>` in request extensions
 (`http::Request::builder().extension(Arc::<str>::from("websocket"))`).
-That extension type is reserved for `:protocol`; the token is stored separately from ordinary fields. `ReadRequest::protocol()` returns `Option<Arc<str>>`.
+That extension type is reserved for `:protocol`; read it through
+`request.extensions().get::<Arc<str>>()`.
 For WebSocket CONNECT requests, outgoing `ws://` and `wss://` URIs are normalized
 to the required `http://` and `https://` target schemes respectively.

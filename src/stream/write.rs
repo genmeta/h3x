@@ -4,20 +4,23 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::Bytes;
+use http_body_util::BodyExt;
 use qrecovery::send::CancelStream;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::{ArcH3Stream, H3Stream, StreamEventHandler};
 use crate::{
-    ArcQpack, Error, ErrorCode, TransportError,
+    ArcQpack, ArcWndBuf, Body, Error, ErrorCode, Result, Trailers, TransportError,
     common::{
+        Write,
         request::{Request, WriteRequest},
         response::{Response, WriteResponse},
     },
     frame::{self, Data, Frame, Write as _},
     qpack::Field,
 };
+
+const SEND_WINDOW_BYTES: usize = 64 * 1024;
 
 /// Application-owned write direction, sharing state with the connection registry.
 pub struct H3WriteStream<W: CancelStream> {
@@ -32,12 +35,6 @@ impl<W: CancelStream> H3WriteStream<W> {
             state: ArcH3Stream::new(stream),
             id: stream_id,
             events,
-        }
-    }
-
-    fn finish(&self) {
-        if self.state.finish() {
-            (self.events)(Ok(()));
         }
     }
 
@@ -213,82 +210,84 @@ impl<W: AsyncWrite + CancelStream + TransportError + Unpin> AsyncWrite for H3Wri
 
 impl<W: CancelStream> Drop for H3WriteStream<W> {
     fn drop(&mut self) {
-        self.finish();
+        let unfinished = matches!(
+            self.state.0.lock().unwrap().as_ref(),
+            Ok(H3Stream::Idle(_) | H3Stream::Polling(_, _))
+        );
+        // Invoke cancellation after releasing the state lock; callbacks re-enter the registry.
+        if unfinished {
+            self.cancel(ErrorCode::RequestCancelled.as_u64());
+        }
     }
 }
 
-impl<W> WriteRequest for H3WriteStream<W>
+impl<W, B> WriteRequest<B> for H3WriteStream<W>
+where
+    W: AsyncWrite + CancelStream + TransportError + Unpin + Send + 'static,
+    B: http_body::Body<Data = bytes::Bytes> + Send,
+    B::Error: Into<crate::BoxError>,
+{
+    async fn write_request(mut self, request: http::Request<B>, qpack: ArcQpack) -> Result<()> {
+        let (head, source) = request.into_parts();
+        let request = Request::<Write>::from(http::Request::from_parts(
+            head,
+            ArcWndBuf::new(SEND_WINDOW_BYTES),
+        ));
+        let fields = request.fields();
+        let window = request.body;
+        let trailers = request.trailers;
+        window.on_error(self.error_handler());
+
+        let sending = self.write_frames(fields, &window, &trailers, &qpack);
+        let forwarding = forward_body(source, window.clone(), trailers.clone());
+        // These futures share the caller's task; failure drops the other future.
+        match tokio::try_join!(biased; sending, forwarding) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let error = if error.is_connection() {
+                    qpack.on_connection_error(error)
+                } else {
+                    error.stream()
+                };
+                self.fail(error.clone());
+                window.error(error.clone());
+                Err(qpack.error().unwrap_or(error))
+            }
+        }
+    }
+}
+
+impl<W> WriteRequest<ArcWndBuf> for H3WriteStream<W>
 where
     W: AsyncWrite + CancelStream + TransportError + Unpin + Send + 'static,
 {
-    async fn write_request(
+    fn write_request(
         mut self,
-        request: Request<crate::W>,
+        request: http::Request<ArcWndBuf>,
         qpack: ArcQpack,
-    ) -> crate::Result<()> {
-        let mut fields = Vec::with_capacity(request.head.headers.len() + 5);
-        for (name, value) in request.pseudo_headers() {
-            if let Some(value) = value {
-                fields.push(Field {
-                    name: Bytes::from_static(name),
-                    value: Bytes::copy_from_slice(value.as_bytes()),
-                    never_index: false,
-                });
-            }
-        }
-        fields.extend(request.head.headers.iter().map(|(name, value)| Field {
-            name: Bytes::copy_from_slice(name.as_str().as_bytes()),
-            value: Bytes::copy_from_slice(value.as_bytes()),
-            never_index: value.is_sensitive(),
-        }));
-        let trailers = request.trailers.clone();
-        let body = request.body;
-        body.on_error(self.error_handler());
-        let producer = body.clone();
-        let result: crate::Result<()> = async {
-            let field_section = qpack.encode(self.stream_id(), fields)?;
-            let headers = Frame::new(frame::Headers { field_section }).map_err(Error::stream)?;
-            let mut bytes = Vec::new();
-            bytes.put_frame(&headers);
-            self.write_all(&bytes).await.map_err(W::map_error)?;
-
-            loop {
-                let chunk = body
-                    .read_chunk(frame::MAX_DATA_CHUNK)
-                    .await
-                    .map_err(Error::from)
-                    .map_err(Error::stream)?;
-                if chunk.is_empty() {
-                    break;
+    ) -> impl Future<Output = Result<()>> + Send {
+        let request = Request::<Write>::from(request);
+        let fields = request.fields();
+        let window = request.body;
+        let trailers = request.trailers;
+        // Bind cancellation before the future is first polled, so a caller can
+        // reset the window immediately without losing its requested error code.
+        window.on_error(self.error_handler());
+        async move {
+            match self.write_frames(fields, &window, &trailers, &qpack).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let error = if error.is_connection() {
+                        qpack.on_connection_error(error)
+                    } else {
+                        error.stream()
+                    };
+                    self.fail(error.clone());
+                    window.error(error.clone());
+                    Err(qpack.error().unwrap_or(error))
                 }
-                bytes.clear();
-                bytes.put_frame(&Frame::new(Data(chunk.len())).map_err(Error::stream)?);
-                self.write_all(&bytes).await.map_err(W::map_error)?;
-                self.write_all(&chunk).await.map_err(W::map_error)?;
             }
-            let trailer_fields = trailers.fields();
-            if !trailer_fields.is_empty() {
-                bytes.clear();
-                let field_section = qpack.encode(self.stream_id(), trailer_fields)?;
-                bytes.put_frame(
-                    &Frame::new(frame::Headers { field_section }).map_err(Error::stream)?,
-                );
-                self.write_all(&bytes).await.map_err(W::map_error)?;
-            }
-            self.shutdown().await.map_err(W::map_error)?;
-            Ok::<_, Error>(())
         }
-        .await;
-        result.map_err(|failure| {
-            let failure = if failure.is_connection() {
-                qpack.on_connection_error(failure)
-            } else {
-                failure.stream()
-            };
-            self.fail(failure.clone());
-            producer.error(failure.clone());
-            qpack.error().unwrap_or(failure)
-        })
     }
 }
 
@@ -298,87 +297,133 @@ where
 {
     async fn write_response(
         mut self,
-        response: Response<crate::W>,
-        request_method: http::Method,
+        response: http::Response<Body>,
+        method: http::Method,
         qpack: ArcQpack,
-    ) -> crate::Result<()> {
-        let send_body = request_method != http::Method::HEAD
-            && response.head.status != http::StatusCode::NO_CONTENT
-            && response.head.status != http::StatusCode::NOT_MODIFIED;
-        let mut fields = Vec::with_capacity(response.head.headers.len() + 1);
-        for (name, value) in response.pseudo_headers() {
-            if let Some(value) = value {
-                fields.push(Field {
-                    name: Bytes::from_static(name),
-                    value: Bytes::copy_from_slice(value.as_bytes()),
-                    never_index: false,
-                });
+    ) -> Result<()> {
+        let (head, source) = response.into_parts();
+        let send_body = method != http::Method::HEAD
+            && head.status != http::StatusCode::NO_CONTENT
+            && head.status != http::StatusCode::NOT_MODIFIED;
+        let source = if send_body {
+            source
+        } else {
+            // Discard forbidden content without ever polling the application body.
+            drop(source);
+            Body::default()
+        };
+        let response = Response::<Write>::from(http::Response::from_parts(
+            head,
+            ArcWndBuf::new(SEND_WINDOW_BYTES),
+        ));
+        let fields = response.fields();
+        let window = response.body;
+        let trailers = response.trailers;
+        window.on_error(self.error_handler());
+
+        let sending = self.write_frames(fields, &window, &trailers, &qpack);
+        let forwarding = forward_body(source, window.clone(), trailers.clone());
+        // These futures share the caller's task; failure drops the other future.
+        match tokio::try_join!(biased; sending, forwarding) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let error = if error.is_connection() {
+                    qpack.on_connection_error(error)
+                } else {
+                    error.stream()
+                };
+                self.fail(error.clone());
+                window.error(error.clone());
+                Err(qpack.error().unwrap_or(error))
             }
         }
-        fields.extend(response.head.headers.iter().map(|(name, value)| Field {
-            name: Bytes::copy_from_slice(name.as_str().as_bytes()),
-            value: Bytes::copy_from_slice(value.as_bytes()),
-            never_index: value.is_sensitive(),
-        }));
-        let trailers = response.trailers.clone();
-        let mut body = response.body;
-        body.on_error(self.error_handler());
-        let producer = body.clone();
-        async {
-            if !send_body {
-                body.shutdown()
-                    .await
-                    .map_err(Error::from)
-                    .map_err(Error::stream)?;
+    }
+}
+
+impl<W> H3WriteStream<W>
+where
+    W: AsyncWrite + CancelStream + TransportError + Unpin + Send + 'static,
+{
+    async fn write_frames(
+        &mut self,
+        fields: Vec<Field>,
+        window: &ArcWndBuf,
+        trailers: &Trailers,
+        qpack: &ArcQpack,
+    ) -> Result<()> {
+        let field_section = qpack.encode(self.stream_id(), fields)?;
+        let headers = Frame::new(frame::Headers { field_section }).map_err(Error::stream)?;
+        let mut encoded = Vec::new();
+        encoded.put_frame(&headers);
+        self.write_all(&encoded).await.map_err(W::map_error)?;
+
+        loop {
+            let chunk = window
+                .read_chunk(frame::MAX_DATA_CHUNK)
+                .await
+                .map_err(Error::from_stream_io)?;
+            if chunk.is_empty() {
+                break;
             }
+            encoded.clear();
+            encoded.put_frame(&Frame::new(Data(chunk.len())).map_err(Error::stream)?);
+            self.write_all(&encoded).await.map_err(W::map_error)?;
+            self.write_all(&chunk).await.map_err(W::map_error)?;
+        }
+
+        // The producer installs trailers before publishing window EOF.
+        let fields = trailers.fields();
+        if !fields.is_empty() {
             let field_section = qpack.encode(self.stream_id(), fields)?;
             let headers = Frame::new(frame::Headers { field_section }).map_err(Error::stream)?;
-            let mut bytes = Vec::new();
-            bytes.put_frame(&headers);
-            self.write_all(&bytes).await.map_err(W::map_error)?;
-
-            if send_body {
-                loop {
-                    let chunk = body
-                        .read_chunk(frame::MAX_DATA_CHUNK)
-                        .await
-                        .map_err(Error::from)
-                        .map_err(Error::stream)?;
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    bytes.clear();
-                    bytes.put_frame(&Frame::new(Data(chunk.len())).map_err(Error::stream)?);
-                    self.write_all(&bytes).await.map_err(W::map_error)?;
-                    self.write_all(&chunk).await.map_err(W::map_error)?;
-                }
-            }
-            if send_body {
-                let trailer_fields = trailers.fields();
-                if !trailer_fields.is_empty() {
-                    bytes.clear();
-                    let field_section = qpack.encode(self.stream_id(), trailer_fields)?;
-                    bytes.put_frame(
-                        &Frame::new(frame::Headers { field_section }).map_err(Error::stream)?,
-                    );
-                    self.write_all(&bytes).await.map_err(W::map_error)?;
-                }
-            }
-            self.shutdown().await.map_err(W::map_error)?;
-            Ok::<_, Error>(())
+            encoded.clear();
+            encoded.put_frame(&headers);
+            self.write_all(&encoded).await.map_err(W::map_error)?;
         }
-        .await
-        .map_err(|failure| {
-            let failure = if failure.is_connection() {
-                qpack.on_connection_error(failure)
-            } else {
-                failure.stream()
-            };
-            self.fail(failure.clone());
-            producer.error(failure.clone());
-            qpack.error().unwrap_or(failure)
-        })
+        self.shutdown().await.map_err(W::map_error)
     }
+}
+
+async fn forward_body<B>(source: B, mut window: ArcWndBuf, trailers: Trailers) -> Result<()>
+where
+    B: http_body::Body<Data = bytes::Bytes>,
+    B::Error: Into<crate::BoxError>,
+{
+    let mut source = std::pin::pin!(source);
+    let mut has_trailers = false;
+    loop {
+        let frame = match source.frame().await {
+            Some(frame) => frame.map_err(|source| {
+                let error = ErrorCode::RequestCancelled
+                    .stream("outgoing body failed")
+                    .with_source(source.into());
+                window.error(error.clone());
+                error
+            })?,
+            None => break,
+        };
+        if has_trailers {
+            let error = ErrorCode::MessageError.stream("body frame after trailers");
+            window.error(error.clone());
+            return Err(error);
+        }
+        match frame.into_data() {
+            Ok(data) => window
+                .write_bytes(data)
+                .await
+                .map_err(Error::from_stream_io)?,
+            Err(frame) => {
+                if let Ok(fields) = frame.into_trailers() {
+                    has_trailers = true;
+                    for (name, value) in &fields {
+                        trailers.append(name.clone(), value.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Publish EOF only after all trailer fields have been installed.
+    window.shutdown().await.map_err(Error::from_stream_io)
 }
 
 #[cfg(test)]

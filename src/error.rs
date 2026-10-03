@@ -11,14 +11,21 @@ pub enum Error {
 
 /// The protocol code and diagnostic text carried by [`Error`].
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[error("{code}: {reason}")]
 pub struct ErrorDetail {
     pub code: ErrorCode,
     pub reason: String,
+    #[source]
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
 impl Error {
+    pub(crate) fn with_source(mut self, source: crate::BoxError) -> Self {
+        self.source = Some(Arc::from(source));
+        self
+    }
+
     pub fn stream(self) -> Self {
         let detail = match self {
             Self::Stream(detail) | Self::Connection(detail) => detail,
@@ -35,6 +42,20 @@ impl Error {
 
     pub(crate) fn is_connection(&self) -> bool {
         matches!(self, Self::Connection(_))
+    }
+}
+
+// Equality identifies the protocol failure; local diagnostic sources are not compared.
+impl PartialEq for ErrorDetail {
+    fn eq(&self, other: &Self) -> bool {
+        self.code == other.code && self.reason == other.reason
+    }
+}
+impl Eq for ErrorDetail {}
+impl std::hash::Hash for ErrorDetail {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.code.hash(state);
+        self.reason.hash(state);
     }
 }
 
@@ -140,6 +161,7 @@ impl ErrorCode {
         Error::Stream(ErrorDetail {
             code: self,
             reason: reason.into(),
+            source: None,
         })
     }
 
@@ -148,6 +170,7 @@ impl ErrorCode {
         Error::Connection(ErrorDetail {
             code: self,
             reason: reason.into(),
+            source: None,
         })
     }
 

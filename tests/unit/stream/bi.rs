@@ -261,19 +261,22 @@ fn no_error_cancels_qpack_decode_only_when_reading_stops() {
 }
 
 #[test]
-fn dropping_application_handles_only_unregisters_each_direction() {
-    let streams = Streams::new(Role::Client);
-    let clone = streams.clone();
-    let (read, write, recv, send) = insert(&streams, 0);
-    assert_eq!(read.stream_id(), 0);
-    assert_eq!(write.stream_id(), 0);
-    drop(read);
-    assert!(clone.lock().unwrap().reads.is_empty());
-    assert_eq!(clone.lock().unwrap().writes.len(), 1);
-    drop(write);
-    assert!(clone.lock().unwrap().writes.is_empty());
-    assert!(recv.codes().is_empty());
-    assert!(send.codes().is_empty());
+fn dropping_either_unfinished_handle_cancels_the_exchange_once() {
+    for read_first in [true, false] {
+        let streams = Streams::new(Role::Client);
+        let (read, write, recv, send) = insert(&streams, 0);
+        if read_first {
+            drop(read);
+            drop(write);
+        } else {
+            drop(write);
+            drop(read);
+        }
+        assert!(streams.lock().unwrap().reads.is_empty());
+        assert!(streams.lock().unwrap().writes.is_empty());
+        assert_eq!(recv.codes(), [ErrorCode::RequestCancelled.as_u64()]);
+        assert_eq!(send.codes(), [ErrorCode::RequestCancelled.as_u64()]);
+    }
 }
 
 #[test]
@@ -529,7 +532,7 @@ async fn reset_during_headers_emits_qpack_stream_cancellation() {
         qpack.clone(),
     );
 
-    let result: crate::Result<crate::Request<crate::R>> = read.read_request(qpack).await;
+    let result: crate::Result<http::Request<crate::Body>> = read.read_request(qpack).await;
     let Err(error) = result else {
         panic!("RESET during HEADERS must fail the request")
     };
@@ -560,7 +563,7 @@ async fn eof_before_request_headers_cancels_the_response_direction() {
         qpack.clone(),
     );
 
-    let result: crate::Result<crate::Request<crate::R>> = read.read_request(qpack.clone()).await;
+    let result: crate::Result<http::Request<crate::Body>> = read.read_request(qpack.clone()).await;
     let Err(error) = result else {
         panic!("EOF before request HEADERS must fail the request")
     };
@@ -597,7 +600,7 @@ async fn eof_after_informational_headers_cancels_the_request_direction() {
         qpack.clone(),
     );
 
-    let result: crate::Result<crate::Response<crate::R>> =
+    let result: crate::Result<http::Response<crate::Body>> =
         read.read_response(http::Method::GET, qpack.clone()).await;
     let Err(error) = result else {
         panic!("EOF before final response HEADERS must fail the request")
