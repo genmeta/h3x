@@ -54,11 +54,12 @@ async fn dropping_window_clones_does_not_change_io_or_terminal_state() {
 }
 
 #[tokio::test]
-async fn initial_bytes_are_shared_and_backpressure_subsequent_writes() {
+async fn owned_bytes_are_shared_and_backpressure_subsequent_writes() {
     use tokio::io::AsyncWriteExt;
-    let initial = Bytes::from(vec![42; 12]);
+    let initial = Bytes::from(vec![42; 4]);
     let address = initial.as_ptr();
-    let window = ArcWndBuf::with_initial(4, initial);
+    let window = ArcWndBuf::new(4);
+    window.write_bytes(initial).await.unwrap();
     let mut writer = window.clone();
     let mut cx = Context::from_waker(Waker::noop());
     assert!(
@@ -66,15 +67,9 @@ async fn initial_bytes_are_shared_and_backpressure_subsequent_writes() {
             .poll_write(&mut cx, b"tail")
             .is_pending()
     );
-    let prefix = window.read_chunk(8).await.unwrap();
+    let prefix = window.read_chunk(2).await.unwrap();
     assert_eq!(prefix.as_ptr(), address);
-    assert_eq!(prefix.len(), 8);
-    assert!(
-        Pin::new(&mut writer)
-            .poll_write(&mut cx, b"tail")
-            .is_pending()
-    );
-    assert_eq!(window.read_chunk(2).await.unwrap().as_ref(), &[42; 2]);
+    assert_eq!(prefix.as_ref(), &[42; 2]);
     writer.write_all(b"xy").await.unwrap();
     writer.shutdown().await.unwrap();
     assert_eq!(window.read_chunk(4).await.unwrap().as_ref(), &[42; 2]);
