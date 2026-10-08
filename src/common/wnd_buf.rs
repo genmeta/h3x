@@ -142,20 +142,8 @@ impl std::fmt::Debug for ArcWndBuf {
 
 impl ArcWndBuf {
     pub fn new(capacity: usize) -> Self {
-        Self::with_initial(capacity, Bytes::new())
-    }
-
-    /// Start with owned bytes without copying or waiting for a consumer.
-    /// Initial bytes may exceed capacity; further writes wait until the queued
-    /// bytes fall below capacity. Capacity bounds subsequent streaming writes.
-    pub fn with_initial(capacity: usize, initial: Bytes) -> Self {
-        let mut window = WndBuf::with_capacity(capacity);
-        if !initial.is_empty() {
-            window.len = initial.len();
-            window.chunks.push_back(initial);
-        }
         Self {
-            window: Arc::new(Mutex::new(Ok(window))),
+            window: Arc::new(Mutex::new(Ok(WndBuf::with_capacity(capacity)))),
             error_cb: Arc::new(Mutex::new(None)),
         }
     }
