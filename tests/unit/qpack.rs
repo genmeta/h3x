@@ -251,12 +251,6 @@ fn instruction_queue_errors_map_to_connection_errors() {
 #[test]
 fn caller_selects_error_scope_independently_of_the_code() {
     let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
-    qpack
-        .with_state(|state| {
-            state.decoder.on_instruction(|_| Ok(()));
-            Ok(())
-        })
-        .unwrap();
     let stream_error = ErrorCode::InternalError.stream("stream");
     let stream_error = qpack.on_stream_error(0, stream_error.clone());
     assert!(matches!(stream_error, Error::Stream(_)));
@@ -292,27 +286,20 @@ async fn instruction_writers_process_batches_and_report_critical_close() {
         ErrorCode::ClosedCriticalStream
     );
 
-    let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(2);
-    decoder_tx
-        .send(vec![
-            DecoderInstruction::SectionAcknowledgment(0),
-            DecoderInstruction::StreamCancellation(4),
-            DecoderInstruction::InsertCountIncrement(1),
-        ])
+    let (mut writer, mut reader) = tokio::io::duplex(128);
+    qpack.cancel_decode(vec![4]).unwrap();
+    let writing = {
+        let qpack = qpack.clone();
+        tokio::spawn(async move { qpack.write_decoder(&mut writer).await })
+    };
+    let mut wire = [0; 2];
+    tokio::io::AsyncReadExt::read_exact(&mut reader, &mut wire)
         .await
         .unwrap();
-    drop(decoder_tx);
-    assert_eq!(
-        qpack
-            .write_decoder(decoder_rx, &mut tokio::io::sink())
-            .await
-            .unwrap_err()
-            .code,
-        ErrorCode::ClosedCriticalStream
-    );
-
+    assert_eq!(wire, [StreamType::QpackDecoder as u8, 0x44]);
     let failed = ErrorCode::InternalError.connection("already failed");
     qpack.on_connection_error(failed.clone());
+    assert_eq!(writing.await.unwrap().unwrap_err(), failed);
     let (_, encoder_rx) = tokio::sync::mpsc::channel(1);
     assert_eq!(
         qpack
@@ -404,18 +391,6 @@ async fn insertion_write_and_completion_are_ordered_before_decoder_feedback() {
 async fn instruction_receivers_apply_valid_input_then_map_eof() {
     let settings = super::super::connection::Settings::new(4096, 128, 1).unwrap();
     let qpack = ArcQpack::new(&settings).unwrap();
-    let feedback = Arc::new(Mutex::new(Vec::new()));
-    let captured = feedback.clone();
-    qpack
-        .with_state(|state| {
-            state.decoder.on_instruction(move |batch| {
-                captured.lock().unwrap().push(batch);
-                Ok(())
-            });
-            Ok(())
-        })
-        .unwrap();
-
     let mut encoder_wire = Vec::new();
     encoder_wire
         .put_encoder_instruction(&EncoderInstruction::SetDynamicTableCapacity(128))
@@ -435,7 +410,10 @@ async fn instruction_receivers_apply_valid_input_then_map_eof() {
         ErrorCode::ClosedCriticalStream
     );
     assert!(matches!(
-        feedback.lock().unwrap()[0].as_slice(),
+        qpack
+            .with_state(|state| Ok(state.decoder.take_feedback().0))
+            .unwrap()
+            .as_slice(),
         [DecoderInstruction::InsertCountIncrement(1)]
     ));
 
@@ -502,13 +480,12 @@ async fn qpack_stream_sync_maps_open_failures_and_closes_transport() {
     for mode in [0, 1, 2] {
         let qpack = ArcQpack::new(&super::super::connection::Settings::default()).unwrap();
         let transport = Arc::new(TestTransport::new(mode));
-        let (_, decoder_rx) = tokio::sync::mpsc::channel(1);
-        assert!(
-            qpack
-                .sync_decoder_with(transport.clone(), decoder_rx)
-                .await
-                .is_err()
-        );
+        if mode == 1 {
+            qpack.on_connection_error(
+                ErrorCode::ClosedCriticalStream.connection("test peer closed"),
+            );
+        }
+        assert!(qpack.sync_decoder_with(transport.clone()).await.is_err());
         assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
     }
 }
@@ -519,7 +496,6 @@ async fn configure_cancel_waiters_and_writer_io_errors_are_propagated() {
     let qpack = ArcQpack::new(&settings).unwrap();
     qpack
         .with_state(|state| {
-            state.decoder.on_instruction(|_| Ok(()));
             state.encoder.on_instruction(|_| Ok(()));
             Ok(())
         })
@@ -566,11 +542,9 @@ async fn configure_cancel_waiters_and_writer_io_errors_are_propagated() {
             .code,
         ErrorCode::ClosedCriticalStream
     );
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    drop(tx);
     assert_eq!(
         qpack
-            .write_decoder(rx, &mut FailingWriter)
+            .write_decoder(&mut FailingWriter)
             .await
             .unwrap_err()
             .code,
@@ -592,6 +566,9 @@ async fn configure_cancel_waiters_and_writer_io_errors_are_propagated() {
         qpack
             .on_stream_error(0, ErrorCode::NoError.connection("cancel"))
             .code,
-        ErrorCode::InternalError
+        ErrorCode::NoError
     );
 }
+
+#[path = "qpack/feedback.rs"]
+mod feedback;

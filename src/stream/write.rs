@@ -23,6 +23,9 @@ use crate::{
 const SEND_WINDOW_BYTES: usize = 64 * 1024;
 
 /// Application-owned write direction, sharing state with the connection registry.
+/// `flush()` forwards to the transport and waits for peer acknowledgement.
+/// Message writers send HEADERS and DATA without flushing each frame, then
+/// finish with `shutdown()` to send FIN and wait for acknowledgement.
 pub struct H3WriteStream<W: CancelStream> {
     pub(super) state: ArcH3Stream<W>,
     events: StreamEventHandler,

@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::Error;
@@ -16,8 +16,6 @@ use crate::Error;
 #[derive(Debug)]
 pub(crate) struct WndBuf {
     chunks: VecDeque<Bytes>,
-    // Coalesce borrowed AsyncWrite calls until the consumer takes ownership.
-    pending: BytesMut,
     capacity: usize,
     len: usize,
     read_waker: Option<Waker>,
@@ -31,7 +29,6 @@ impl WndBuf {
         assert!(capacity > 0, "window capacity must be nonzero");
         Self {
             chunks: VecDeque::new(),
-            pending: BytesMut::new(),
             capacity,
             len: 0,
             read_waker: None,
@@ -60,18 +57,13 @@ impl AsyncRead for WndBuf {
         let len = buf.remaining().min(self.len);
         let mut remaining = len;
         while remaining > 0 {
-            if let Some(chunk) = self.chunks.front_mut() {
-                let count = remaining.min(chunk.len());
-                buf.put_slice(&chunk[..count]);
-                chunk.advance(count);
-                remaining -= count;
-                if chunk.is_empty() {
-                    self.chunks.pop_front();
-                }
-            } else {
-                buf.put_slice(&self.pending[..remaining]);
-                self.pending.advance(remaining);
-                break;
+            let chunk = self.chunks.front_mut().unwrap();
+            let count = remaining.min(chunk.len());
+            buf.put_slice(&chunk[..count]);
+            chunk.advance(count);
+            remaining -= count;
+            if chunk.is_empty() {
+                self.chunks.pop_front();
             }
         }
         self.len -= len;
@@ -101,7 +93,7 @@ impl AsyncWrite for WndBuf {
             self.write_waker = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        self.pending.extend_from_slice(&buf[..len]);
+        self.chunks.push_back(Bytes::copy_from_slice(&buf[..len]));
         self.len += len;
         if let Some(waker) = self.read_waker.take() {
             waker.wake();
@@ -157,7 +149,6 @@ impl ArcWndBuf {
         self.poll_io(|mut window| {
             let mut chunk = match window.chunks.pop_front() {
                 Some(chunk) => chunk,
-                None if !window.pending.is_empty() => window.pending.split().freeze(),
                 None if window.fin => return Poll::Ready(Ok(Bytes::new())),
                 None => {
                     window.read_waker = Some(cx.waker().clone());
@@ -203,10 +194,6 @@ impl ArcWndBuf {
             if count == 0 {
                 window.write_waker = Some(cx.waker().clone());
                 return Poll::Pending;
-            }
-            if !window.pending.is_empty() {
-                let pending = window.pending.split().freeze();
-                window.chunks.push_back(pending);
             }
             window.chunks.push_back(bytes.split_to(count));
             window.len += count;

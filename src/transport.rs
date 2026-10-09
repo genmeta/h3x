@@ -31,6 +31,11 @@ pub trait TransportError {
 pub trait Transport: Send + Sync + 'static {
     /// Report FIN as a successful read of zero bytes and retain RESET metadata in I/O errors.
     type StreamReader: AsyncRead + StopSending + TransportError + Unpin + Send + 'static;
+    /// Accepted writes must drive transmission without requiring a flush.
+    /// Successful flush must wait for peer acknowledgement of all written bytes;
+    /// GOAWAY relies on this before closing the connection. Successful shutdown
+    /// must also wait for acknowledgement of FIN so request draining cannot
+    /// discard queued data. Extra adapter buffering must preserve these semantics.
     type StreamWriter: AsyncWrite + CancelStream + TransportError + Unpin + Send + 'static;
 
     fn role(&self) -> Role;

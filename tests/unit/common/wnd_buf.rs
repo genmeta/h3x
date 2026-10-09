@@ -76,3 +76,36 @@ async fn owned_bytes_are_shared_and_backpressure_subsequent_writes() {
     assert_eq!(window.read_chunk(4).await.unwrap(), "xy");
     assert!(window.read_chunk(4).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn mixed_writes_preserve_order_across_chunk_and_async_reads() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut window = ArcWndBuf::new(6);
+    window.write_all(b"ab").await.unwrap();
+    window.write_bytes(Bytes::from_static(b"cd")).await.unwrap();
+    window.write_all(b"ef").await.unwrap();
+
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        Pin::new(&mut window)
+            .poll_write(&mut cx, b"gh")
+            .is_pending()
+    );
+    assert_eq!(window.read_chunk(1).await.unwrap(), "a");
+    assert!(matches!(
+        Pin::new(&mut window).poll_write(&mut cx, b"gh"),
+        Poll::Ready(Ok(1))
+    ));
+
+    let mut prefix = [0; 3];
+    window.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(&prefix, b"bcd");
+    window.write_all(b"h").await.unwrap();
+    window.shutdown().await.unwrap();
+
+    let mut rest = Vec::new();
+    window.read_to_end(&mut rest).await.unwrap();
+    assert_eq!(rest, b"efgh");
+    assert!(window.read_chunk(1).await.unwrap().is_empty());
+}

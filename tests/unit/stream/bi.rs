@@ -61,15 +61,7 @@ fn sid(id: u64) -> StreamId {
 }
 
 fn qpack() -> ArcQpack {
-    let qpack = ArcQpack::new(&Settings::default()).unwrap();
-    qpack
-        .lock()
-        .unwrap()
-        .as_mut()
-        .unwrap()
-        .decoder
-        .on_instruction(|_| Ok(()));
-    qpack
+    ArcQpack::new(&Settings::default()).unwrap()
 }
 
 #[derive(Default)]
@@ -130,21 +122,7 @@ fn cancelling_either_direction_cancels_both_and_completes_drain() {
 fn concurrent_direction_aborts_converge_without_duplicate_transport_cancellation() {
     let streams = Streams::new(Role::Server);
     streams.lock().unwrap().accept(sid(0)).unwrap();
-    let feedback = Arc::new(AtomicUsize::new(0));
     let qpack = ArcQpack::new(&Settings::default()).unwrap();
-    qpack
-        .lock()
-        .unwrap()
-        .as_mut()
-        .unwrap()
-        .decoder
-        .on_instruction({
-            let feedback = feedback.clone();
-            move |batch| {
-                feedback.fetch_add(batch.len(), Ordering::SeqCst);
-                Ok(())
-            }
-        });
     let (mut read, write, recv, send) = insert_with_qpack(&streams, 0, qpack.clone());
     let mut drain = streams.drain();
     let wake_count = Arc::new(WakeCount::default());
@@ -177,12 +155,16 @@ fn concurrent_direction_aborts_converge_without_duplicate_transport_cancellation
     assert!(qpack.lock().unwrap().is_ok());
 
     // Repeated stream-cancellation feedback remains non-fatal.
-    let feedback_before_duplicates = feedback.load(Ordering::SeqCst);
+    let _feedback_before_duplicates = qpack
+        .with_state(|state| Ok(state.decoder.take_feedback().0.len()))
+        .unwrap();
     qpack.cancel_decode(vec![0]).unwrap();
     qpack.cancel_decode(vec![0]).unwrap();
     assert_eq!(
-        feedback.load(Ordering::SeqCst),
-        feedback_before_duplicates + 2
+        qpack
+            .with_state(|state| Ok(state.decoder.take_feedback().0.len()))
+            .unwrap(),
+        2
     );
     assert!(qpack.lock().unwrap().is_ok());
 }
@@ -231,17 +213,6 @@ fn no_error_cancels_qpack_decode_only_when_reading_stops() {
     for stop_read in [true, false] {
         let streams = Streams::new(Role::Client);
         let qpack = qpack();
-        let feedback = Arc::new(Mutex::new(Vec::new()));
-        let captured = feedback.clone();
-        qpack
-            .with_state(|state| {
-                state.decoder.on_instruction(move |batch| {
-                    captured.lock().unwrap().push(format!("{batch:?}"));
-                    Ok(())
-                });
-                Ok(())
-            })
-            .unwrap();
         let (mut read, write, _, _) = insert_with_qpack(&streams, 0, qpack.clone());
 
         if stop_read {
@@ -255,7 +226,15 @@ fn no_error_cancels_qpack_decode_only_when_reading_stops() {
         } else {
             vec![]
         };
-        assert_eq!(*feedback.lock().unwrap(), expected);
+        let batch = qpack
+            .with_state(|state| Ok(state.decoder.take_feedback().0))
+            .unwrap();
+        let feedback = if batch.is_empty() {
+            vec![]
+        } else {
+            vec![format!("{batch:?}")]
+        };
+        assert_eq!(feedback, expected);
         assert!(qpack.error().is_none());
     }
 }
@@ -318,19 +297,6 @@ fn rejection_is_inclusive_directional_sorted_and_deduplicated() {
 fn goaway_batches_more_cancellations_than_the_feedback_queue_capacity() {
     let streams = Streams::new(Role::Client);
     let qpack = ArcQpack::new(&Settings::default()).unwrap();
-    let (feedback_tx, mut feedback_rx) =
-        tokio::sync::mpsc::channel(crate::qpack::MAX_PENDING_INSTRUCTION);
-    qpack
-        .with_state(|state| {
-            state.decoder.on_instruction(move |batch| {
-                feedback_tx
-                    .try_send(batch)
-                    .map_err(crate::qpack::instruction_send_error)
-            });
-            Ok(())
-        })
-        .unwrap();
-
     let handles = (0..=17)
         .map(|index| {
             let id = index * 4;
@@ -346,7 +312,9 @@ fn goaway_batches_more_cancellations_than_the_feedback_queue_capacity() {
     assert_eq!(guard.writes.len(), 1);
     drop(guard);
 
-    let batch = feedback_rx.try_recv().unwrap();
+    let batch = qpack
+        .with_state(|state| Ok(state.decoder.take_feedback().0))
+        .unwrap();
     assert_eq!(batch.len(), 17);
     let mut cancellations = batch
         .iter()
@@ -358,7 +326,12 @@ fn goaway_batches_more_cancellations_than_the_feedback_queue_capacity() {
         .collect::<Vec<_>>();
     expected.sort();
     assert_eq!(cancellations, expected);
-    assert!(feedback_rx.try_recv().is_err());
+    assert!(
+        qpack
+            .with_state(|state| Ok(state.decoder.take_feedback().0))
+            .unwrap()
+            .is_empty()
+    );
     assert!(qpack.error().is_none());
     assert!(handles[0].1.2.codes().is_empty());
     assert!(handles[0].1.3.codes().is_empty());
@@ -508,17 +481,6 @@ impl TransportError for ResetReader {
 async fn reset_during_headers_emits_qpack_stream_cancellation() {
     let streams = ArcBiStreams::<ResetReader, Io>::new(Role::Server);
     let qpack = ArcQpack::new(&Settings::default()).unwrap();
-    let feedback = Arc::new(Mutex::new(Vec::new()));
-    let captured = feedback.clone();
-    qpack
-        .with_state(|state| {
-            state.decoder.on_instruction(move |batch| {
-                captured.lock().unwrap().push(format!("{batch:?}"));
-                Ok(())
-            });
-            Ok(())
-        })
-        .unwrap();
     let send = Io::default();
     let (read, write) = streams.insert(
         &mut streams.lock().unwrap(),
@@ -532,14 +494,19 @@ async fn reset_during_headers_emits_qpack_stream_cancellation() {
         qpack.clone(),
     );
 
-    let result: crate::Result<http::Request<crate::Body>> = read.read_request(qpack).await;
+    let result: crate::Result<http::Request<crate::Body>> = read.read_request(qpack.clone()).await;
     let Err(error) = result else {
         panic!("RESET during HEADERS must fail the request")
     };
     assert_eq!(error.code, ErrorCode::RequestCancelled);
     assert_eq!(
-        feedback.lock().unwrap().as_slice(),
-        ["[StreamCancellation(0)]"]
+        format!(
+            "{:?}",
+            qpack
+                .with_state(|state| Ok(state.decoder.take_feedback().0))
+                .unwrap()
+        ),
+        "[StreamCancellation(0)]"
     );
     assert_eq!(send.codes(), [ErrorCode::RequestCancelled.as_u64()]);
     assert!(streams.lock().unwrap().reads.is_empty());

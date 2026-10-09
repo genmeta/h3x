@@ -260,12 +260,6 @@ fn events() -> StreamEventHandler {
 #[test]
 fn stop_before_decode_registration_prevents_a_new_qpack_wait() {
     let qpack = crate::qpack::tests::qpack();
-    qpack
-        .with_state(|state| {
-            state.decoder.on_instruction(|_| Ok(()));
-            Ok(())
-        })
-        .unwrap();
 
     let event_qpack = qpack.clone();
     let stream = Arc::new(H3ReadStream::new(

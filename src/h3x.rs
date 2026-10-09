@@ -24,10 +24,9 @@ pub use transport::{Role, Transport, TransportError};
 /// ALPN token used by HTTP/3.
 pub const ALPN: &[u8] = b"h3";
 
-pub use common::trailers::Trailers;
 /// Shared body storage, also available under its original ArcWndBuf name.
 pub use common::wnd_buf::ArcWndBuf;
-pub use common::wnd_buf::ArcWndBuf as WndBuf;
+pub use common::{trailers::Trailers, wnd_buf::ArcWndBuf as WndBuf};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type Body = http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, BoxError>;

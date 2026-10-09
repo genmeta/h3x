@@ -57,6 +57,13 @@ no stored transport dependency. Connection initialization explicitly starts both
 QPACK writers; the connection owns critical-stream failures and transport termination.
 Local encoding errors, including oversized fields, fail only the current operation.
 
+Decoder feedback owns bounded instruction storage. Insert-count progress is
+coalesced before queueing and stays ordered before dependent acknowledgments.
+When ACK storage fills, field decoding waits for the writer outside the QPACK
+lock; reserved space handles synchronous resets, Drop, and GOAWAY cancellation.
+The existing QPACK change signal wakes both feedback writes and connection
+failure waiters. Encoder queue pressure continues to fall back to literal fields.
+
 `goaway(self).await` stops opening and accepting bidirectional streams on every
 clone, writes the local GOAWAY, waits for the peer GOAWAY and admitted requests
 to finish, then closes QUIC with `H3_NO_ERROR` and applies the terminal state to

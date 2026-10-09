@@ -1,7 +1,4 @@
-use std::{
-    sync::{Arc, Mutex},
-    task::{Context, Poll, Waker},
-};
+use std::task::{Context, Poll, Waker};
 
 use bytes::{Bytes, BytesMut};
 use qbase::varint::VARINT_MAX;
@@ -30,28 +27,18 @@ fn dynamic_wire(required_insert_count: u64, line: FieldLine) -> Vec<u8> {
     wire
 }
 
-fn make_decoder(
-    blocked_streams: u64,
-    blocked_bytes: usize,
-    max_fields: u64,
-) -> (Decoder, Arc<Mutex<Vec<Batch>>>) {
-    let feedback = Arc::new(Mutex::new(Vec::new()));
-    let captured = feedback.clone();
+fn make_decoder(blocked_streams: u64, blocked_bytes: usize, max_fields: u64) -> Decoder {
     let mut decoder =
         Decoder::new(settings(128, blocked_streams), blocked_bytes, max_fields).unwrap();
-    decoder.on_instruction(move |batch| {
-        captured.lock().unwrap().push(batch);
-        Ok(())
-    });
     decoder
         .on_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(128))
         .unwrap();
-    (decoder, feedback)
+    decoder
 }
 
 #[test]
 fn blocked_decode_resumes_after_insert_and_emits_ordered_feedback() {
-    let (mut decoder, feedback) = make_decoder(2, 1024, 1024);
+    let mut decoder = make_decoder(2, 1024, 1024);
     let wire = dynamic_wire(1, FieldLine::IndexedPostBase { index: 0 });
     let (offset, prefix) = decoder.begin_decode(0, &wire).unwrap();
     let waker = Waker::noop();
@@ -80,20 +67,18 @@ fn blocked_decode_resumes_after_insert_and_emits_ordered_feedback() {
     assert_eq!(fields[0].name, "x-dynamic");
     assert_eq!(fields[0].value, "value");
 
-    let feedback = feedback.lock().unwrap();
-    assert!(matches!(
-        feedback[0].as_slice(),
-        [DecoderInstruction::InsertCountIncrement(1)]
-    ));
-    assert!(matches!(
-        feedback[1].as_slice(),
-        [DecoderInstruction::SectionAcknowledgment(0)]
-    ));
+    assert_eq!(
+        decoder.take_feedback().0,
+        vec![
+            DecoderInstruction::InsertCountIncrement(1),
+            DecoderInstruction::SectionAcknowledgment(0),
+        ]
+    );
 }
 
 #[test]
 fn unblocked_unpolled_decode_does_not_consume_blocked_stream_slot() {
-    let (mut decoder, _) = make_decoder(1, 1024, 1024);
+    let mut decoder = make_decoder(1, 1024, 1024);
     let first = dynamic_wire(1, FieldLine::IndexedPostBase { index: 0 });
     let (first_offset, first_prefix) = decoder.begin_decode(0, &first).unwrap();
     let waker = Waker::noop();
@@ -128,7 +113,7 @@ fn cancellation_and_blocking_budgets_clean_up_waiters() {
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
 
-    let (mut decoder, feedback) = make_decoder(1, 1024, 1024);
+    let mut decoder = make_decoder(1, 1024, 1024);
     let (offset, prefix) = decoder.begin_decode(4, &wire).unwrap();
     assert!(decoder.begin_decode(4, &wire).is_err());
     assert!(
@@ -139,8 +124,8 @@ fn cancellation_and_blocking_budgets_clean_up_waiters() {
     assert_eq!(decoder.cancel_registered(4).unwrap().len(), 1);
     assert!(decoder.cancel_registered(4).unwrap().is_empty());
     assert!(matches!(
-        feedback.lock().unwrap().last().unwrap().as_slice(),
-        [DecoderInstruction::StreamCancellation(4)]
+        decoder.take_feedback().0.last(),
+        Some(DecoderInstruction::StreamCancellation(4))
     ));
     assert!(
         decoder
@@ -152,7 +137,7 @@ fn cancellation_and_blocking_budgets_clean_up_waiters() {
         ErrorCode::InternalError
     );
 
-    let (mut no_stream_slots, _) = make_decoder(0, 1024, 1024);
+    let mut no_stream_slots = make_decoder(0, 1024, 1024);
     let (offset, prefix) = no_stream_slots.begin_decode(8, &wire).unwrap();
     let Poll::Ready(Err(error)) =
         no_stream_slots.poll_registered_decode(8, prefix, &wire[offset..], &mut cx)
@@ -161,7 +146,7 @@ fn cancellation_and_blocking_budgets_clean_up_waiters() {
     };
     assert_eq!(error.code, ErrorCode::QpackDecompressionFailed);
 
-    let (mut no_bytes, _) = make_decoder(1, 0, 1024);
+    let mut no_bytes = make_decoder(1, 0, 1024);
     let (offset, prefix) = no_bytes.begin_decode(12, &wire).unwrap();
     let Poll::Ready(Err(error)) =
         no_bytes.poll_registered_decode(12, prefix, &wire[offset..], &mut cx)
@@ -170,7 +155,7 @@ fn cancellation_and_blocking_budgets_clean_up_waiters() {
     };
     assert_eq!(error.code, ErrorCode::ExcessiveLoad);
 
-    let (mut waiting, _) = make_decoder(2, 1024, 1024);
+    let mut waiting = make_decoder(2, 1024, 1024);
     for id in [16, 20] {
         let (offset, prefix) = waiting.begin_decode(id, &wire).unwrap();
         assert!(
@@ -183,7 +168,7 @@ fn cancellation_and_blocking_budgets_clean_up_waiters() {
 }
 
 #[test]
-fn malformed_sections_settings_and_callback_errors_are_rejected() {
+fn malformed_sections_and_settings_are_rejected() {
     assert_eq!(
         Decoder::new(settings(0, VARINT_MAX + 1), 0, 0)
             .err()
@@ -199,7 +184,7 @@ fn malformed_sections_settings_and_callback_errors_are_rejected() {
         ErrorCode::SettingsError
     );
 
-    let (mut decoder, _) = make_decoder(1, 1024, 50);
+    let mut decoder = make_decoder(1, 1024, 50);
     assert_eq!(
         decoder
             .begin_decode(VARINT_MAX + 1, &[0, 0])
@@ -283,19 +268,5 @@ fn malformed_sections_settings_and_callback_errors_are_rejected() {
             .unwrap_err()
             .code,
         ErrorCode::QpackEncoderStreamError
-    );
-
-    let (mut callback_error, _) = make_decoder(1, 1024, 1024);
-    callback_error
-        .on_instruction(|_| Err(ErrorCode::ClosedCriticalStream.connection("feedback closed")));
-    assert_eq!(
-        callback_error
-            .on_encoder_instruction(EncoderInstruction::InsertWithLiteralName {
-                name: Bytes::from_static(b"a"),
-                value: Bytes::from_static(b"b"),
-            })
-            .unwrap_err()
-            .code,
-        ErrorCode::ClosedCriticalStream
     );
 }

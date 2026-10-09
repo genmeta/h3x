@@ -25,7 +25,7 @@ pub(crate) use codec::field::Field;
 use decoder::Decoder;
 use encoder::Encoder;
 
-/// Maximum queued operation batches per QPACK direction. Producers never block.
+/// Maximum queued encoder batches; a full encoder queue falls back to literals.
 pub(super) const MAX_PENDING_INSTRUCTION: usize = 16;
 
 /// Aggregate field bytes retained while waiting for dynamic-table insertions.
@@ -209,20 +209,26 @@ impl ArcQpack {
         };
         poll_fn(|cx| {
             let mut shared = self.lock().unwrap();
-            match &mut *shared {
+            let result = match &mut *shared {
                 Ok(state) => {
                     state
                         .decoder
                         .poll_registered_decode(id, prefix, &payload[offset..], cx)
                 }
                 Err(error) => Poll::Ready(Err(error.clone().connection())),
+            };
+            drop(shared);
+            if matches!(result, Poll::Ready(Ok(_))) {
+                self.1.send_replace(());
             }
+            result
         })
         .await
     }
 
     pub fn cancel_decode(&self, ids: Vec<u64>) -> Result<()> {
         let wakes = self.with_state(|state| state.decoder.cancel(ids))?;
+        self.1.send_replace(());
         for wake in wakes {
             wake.wake();
         }
@@ -256,7 +262,6 @@ impl ArcQpack {
     pub(super) async fn sync_decoder_with<T: crate::Transport>(
         &self,
         transport: Arc<T>,
-        instructions: decoder::Instructions,
     ) -> Result<()> {
         tokio::select! {
             biased;
@@ -265,7 +270,7 @@ impl ArcQpack {
                 let (_, mut send) = transport.open_uni().await?.ok_or_else(|| {
                     ErrorCode::StreamCreationError.connection("unable to create the required stream")
                 })?;
-                self.write_decoder(instructions, &mut send).await
+                self.write_decoder(&mut send).await
             } => result,
         }
         .map_err(|error| {
@@ -279,12 +284,19 @@ impl ArcQpack {
         &self,
         recv: &mut R,
     ) -> Result<()> {
+        let mut processed = 0;
         loop {
             let instruction = codec::instruction::be_encoder_instruction(recv).await?;
             let wakes =
                 self.with_state(|state| state.decoder.on_encoder_instruction(instruction))?;
+            self.1.send_replace(());
             for wake in wakes {
                 wake.wake();
+            }
+            processed += 1;
+            if processed == MAX_PENDING_INSTRUCTION {
+                processed = 0;
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -365,26 +377,39 @@ impl ArcQpack {
         .await
     }
 
-    pub(crate) async fn write_decoder<W: AsyncWrite + Unpin>(
-        &self,
-        mut receiver: decoder::Instructions,
-        writer: &mut W,
-    ) -> Result<()> {
+    pub(crate) async fn write_decoder<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
         writer
             .write_all(&[StreamType::QpackDecoder as u8])
             .await
             .map_err(|error| crate::Error::from_io(error, ErrorCode::ClosedCriticalStream))?;
+        // Reuse the existing QPACK change/failure signal. Subscribe before inspecting
+        // state, so production between the check and changed() cannot be missed.
+        let mut changed = self.1.subscribe();
         let mut buf = Vec::new();
-        while let Some(batch) = receiver.recv().await {
-            for instruction in batch {
-                buf.clear();
-                buf.put_decoder_instruction(&instruction)?;
-                writer.write_all(&buf).await.map_err(|error| {
-                    crate::Error::from_io(error, ErrorCode::ClosedCriticalStream)
-                })?;
+        loop {
+            let (batch, wakes) = self.with_state(|state| Ok(state.decoder.take_feedback()))?;
+            if batch.is_empty() {
+                changed
+                    .changed()
+                    .await
+                    .map_err(|_| self.critical_stream_error())?;
+                continue;
             }
+            // The writer owns this bounded batch. Space is available for the next
+            // bounded batch even when transport I/O is blocked; no detached sends.
+            for wake in wakes {
+                wake.wake();
+            }
+            buf.clear();
+            for instruction in batch {
+                buf.put_decoder_instruction(&instruction)?;
+            }
+            writer
+                .write_all(&buf)
+                .await
+                .map_err(|error| crate::Error::from_io(error, ErrorCode::ClosedCriticalStream))?;
+            tokio::task::yield_now().await;
         }
-        Err(self.critical_stream_error())
     }
 }
 
@@ -405,6 +430,7 @@ impl Drop for StreamDecoder<'_> {
         };
         match result {
             Ok(wakes) => {
+                self.qpack.1.send_replace(());
                 for wake in wakes {
                     wake.wake();
                 }
