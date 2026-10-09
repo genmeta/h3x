@@ -60,13 +60,9 @@ impl<T: Transport> H3Connection<T> {
 
         let qpack = ArcQpack::new(&settings)?;
         let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
-        let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(MAX_PENDING_INSTRUCTION);
         qpack.with_state(|state| {
             state.encoder.on_instruction(move |batch| {
                 encoder_tx.try_send(batch).map_err(instruction_send_error)
-            });
-            state.decoder.on_instruction(move |batch| {
-                decoder_tx.try_send(batch).map_err(instruction_send_error)
             });
             Ok(())
         })?;
@@ -78,7 +74,7 @@ impl<T: Transport> H3Connection<T> {
         tokio::spawn({
             let qpack = qpack.clone();
             let transport = transport.clone();
-            async move { qpack.sync_decoder_with(transport, decoder_rx).await }
+            async move { qpack.sync_decoder_with(transport).await }
         });
 
         let control = Arc::new(control::Control::new(settings));

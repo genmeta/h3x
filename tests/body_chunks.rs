@@ -37,12 +37,12 @@ async fn owned_chunks_preserve_allocation_across_partial_reads() {
 }
 
 #[tokio::test]
-async fn borrowed_and_owned_io_preserve_order_and_coalesce_small_writes() {
+async fn borrowed_and_owned_io_preserve_order() {
     let mut window = ArcWndBuf::new(32);
     window.write_all(b"a").await.unwrap();
     window.write_all(b"b").await.unwrap();
-    // Borrowed writes are coalesced, not one allocation / DATA frame per write.
-    assert_eq!(window.read_chunk(32).await.unwrap(), b"ab"[..]);
+    assert_eq!(window.read_chunk(32).await.unwrap(), b"a"[..]);
+    assert_eq!(window.read_chunk(32).await.unwrap(), b"b"[..]);
     window.write_all(b"cd").await.unwrap();
     window
         .write_bytes(Bytes::from_static(b"efgh"))

@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
 };
@@ -18,6 +18,7 @@ use super::*;
 struct Io {
     bytes: VecDeque<u8>,
     writes_before_failure: Option<usize>,
+    flush_acked: Option<Arc<AtomicBool>>,
     stop_codes: Option<Arc<Mutex<Vec<u64>>>>,
     cancel_codes: Option<Arc<Mutex<Vec<u64>>>>,
 }
@@ -86,7 +87,16 @@ impl AsyncWrite for Io {
         Poll::Ready(Ok(buf.len()))
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+        // ACK-gated tests explicitly repoll after releasing this gate.
+        if self
+            .flush_acked
+            .as_ref()
+            .is_some_and(|acked| !acked.load(Ordering::SeqCst))
+        {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
@@ -122,6 +132,7 @@ struct TestTransport {
     accept: Mutex<Option<Result<BiStream>>>,
     closes: AtomicUsize,
     uni_writes_before_failure: Option<usize>,
+    uni_flush_acked: Option<Arc<AtomicBool>>,
     open_ready: Option<Arc<tokio::sync::Notify>>,
 }
 
@@ -132,6 +143,7 @@ impl TestTransport {
             accept: Mutex::new(Some(accept)),
             closes: AtomicUsize::new(0),
             uni_writes_before_failure: None,
+            uni_flush_acked: None,
             open_ready: None,
         }
     }
@@ -164,11 +176,11 @@ impl Transport for TestTransport {
         self.accept.lock().unwrap().take().unwrap()
     }
     async fn open_uni(&self) -> Result<Option<(u64, Io)>> {
-        Ok(Some((
-            2,
-            self.uni_writes_before_failure
-                .map_or_else(Io::default, Io::fail_after_writes),
-        )))
+        let mut io = self
+            .uni_writes_before_failure
+            .map_or_else(Io::default, Io::fail_after_writes);
+        io.flush_acked = self.uni_flush_acked.clone();
+        Ok(Some((2, io)))
     }
     async fn accept_uni(&self) -> Result<(u64, Io)> {
         Err(ErrorCode::InternalError.connection("unused"))
@@ -342,11 +354,11 @@ async fn unidirectional_stream_types_and_duplicates_fail_the_connection() {
 }
 
 #[tokio::test]
-async fn goaway_notifies_local_waiters_and_closes_after_peer_goaway() {
-    let connection = connection(TestTransport::new(
-        None,
-        Err(ErrorCode::InternalError.connection("unused")),
-    ));
+async fn settings_skip_ack_but_goaway_waits_even_after_peer_goaway_and_drain() {
+    let acked = Arc::new(AtomicBool::new(false));
+    let mut probe = TestTransport::new(None, Err(ErrorCode::InternalError.connection("unused")));
+    probe.uni_flush_acked = Some(acked.clone());
+    let connection = connection(probe);
     let local = connection.local_goaway();
     let qpack = connection.qpack.clone();
     connection
@@ -362,13 +374,27 @@ async fn goaway_notifies_local_waiters_and_closes_after_peer_goaway() {
     let control = connection.control.clone();
     let control_transport = transport.clone();
     let control_qpack = qpack.clone();
-    control
-        .open_uni_and_send_setting(control_transport, control_qpack)
-        .await
-        .unwrap();
-    let shutdown = connection.goaway();
+    let mut initializing =
+        Box::pin(control.open_uni_and_send_setting(control_transport, control_qpack));
+    poll_fn(|cx| {
+        assert!(matches!(
+            initializing.as_mut().poll(cx),
+            Poll::Ready(Ok(()))
+        ));
+        Poll::Ready(())
+    })
+    .await;
+    let mut shutdown = Box::pin(connection.goaway());
     local.await;
+    // The peer GOAWAY is already received and there are no admitted requests.
+    // Local GOAWAY must still be acknowledged before closing the transport.
+    poll_fn(|cx| {
+        assert!(shutdown.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
     assert_eq!(transport.closes.load(Ordering::SeqCst), 0);
+    acked.store(true, Ordering::SeqCst);
     shutdown.await.unwrap();
     assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
 }

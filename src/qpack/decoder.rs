@@ -2,7 +2,6 @@
 use std::task::{Context, Poll, Waker};
 
 use state::State;
-use tokio::sync::mpsc;
 
 use super::{
     Field, Settings,
@@ -14,8 +13,10 @@ use super::{
 use crate::{ErrorCode, Result};
 
 pub(crate) type Batch = Vec<DecoderInstruction>;
-pub(super) type OnInstruction = Box<dyn Fn(Batch) -> Result<()> + Send + Sync>;
-pub(crate) type Instructions = mpsc::Receiver<Batch>;
+// Bound actual instruction storage, rather than a small number of producer batches.
+// Half remains available for synchronous reset/Drop/GOAWAY cancellation.
+pub(super) const MAX_PENDING_FEEDBACK: usize = 64 * 1024 / size_of::<DecoderInstruction>();
+const MAX_PENDING_ACKS: usize = MAX_PENDING_FEEDBACK / 2;
 
 pub(crate) struct Decoder {
     state: State,
@@ -24,23 +25,12 @@ pub(crate) struct Decoder {
 impl Decoder {
     pub(super) fn new(local: Settings, max_blocked_bytes: usize, max_fields: u64) -> Result<Self> {
         Ok(Self {
-            state: State::new(
-                local,
-                max_blocked_bytes,
-                max_fields,
-                Box::new(|_| {
-                    Err(ErrorCode::InternalError
-                        .connection("instruction callback is not registered"))
-                }),
-            )?,
+            state: State::new(local, max_blocked_bytes, max_fields)?,
         })
     }
 
-    pub(crate) fn on_instruction(
-        &mut self,
-        callback: impl Fn(Batch) -> Result<()> + Send + Sync + 'static,
-    ) {
-        self.state.on_instruction = Box::new(callback);
+    pub(crate) fn take_feedback(&mut self) -> (Batch, Vec<Waker>) {
+        self.state.take_feedback()
     }
 
     pub(super) fn take_waiters(&mut self) -> Vec<Waker> {
@@ -103,7 +93,7 @@ impl Decoder {
 mod state {
     //! Decoder state and bounded wait registrations; field bytes stay in the decoding future.
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{HashMap, HashSet, VecDeque},
         task::{Context, Poll, Waker},
     };
 
@@ -126,7 +116,10 @@ mod state {
         waiting: HashMap<u64, (u64, usize, Waker)>,
         blocked_bytes: usize,
         max_blocked_bytes: usize,
-        pub(super) on_instruction: super::OnInstruction,
+        feedback: VecDeque<DecoderInstruction>,
+        // Highest insertion count committed to the ordered feedback stream.
+        // Pending progress is derived from table.insert_count() minus this value.
+        reported_insert_count: u64,
         pub(super) decoding_stream: HashSet<u64>,
     }
 
@@ -135,7 +128,6 @@ mod state {
             local: Settings,
             max_blocked_bytes: usize,
             max_fields: u64,
-            on_instruction: super::OnInstruction,
         ) -> Result<Self> {
             if local.blocked_streams > VARINT_MAX {
                 return Err(ErrorCode::SettingsError.connection(
@@ -149,7 +141,8 @@ mod state {
                 waiting: HashMap::new(),
                 blocked_bytes: 0,
                 max_blocked_bytes,
-                on_instruction,
+                feedback: VecDeque::new(),
+                reported_insert_count: 0,
                 decoding_stream: HashSet::new(),
             })
         }
@@ -183,11 +176,13 @@ mod state {
             cx: &mut Context<'_>,
         ) -> Poll<Result<Vec<Field>>> {
             if prefix.required_insert_count <= self.table.insert_count() {
-                self.finish(id);
                 let fields = self.decode_fields(prefix, bytes)?;
-                self.acknowledge(id, prefix.required_insert_count)
-                    .map_err(Error::connection)?;
-                return Poll::Ready(Ok(fields));
+                if self.acknowledge(id, prefix.required_insert_count)? {
+                    self.finish(id);
+                    return Poll::Ready(Ok(fields));
+                }
+                // The field section is valid, but its mandatory ACK needs space.
+                // Retain the caller's encoded bytes and waker; never await under the lock.
             }
 
             // A pending future may be polled again; only refresh its waker.
@@ -203,7 +198,9 @@ mod state {
                 .values()
                 .filter(|(required, _, _)| *required > insert_count)
                 .count();
-            if blocked as u64 >= self.max_blocked_streams {
+            if prefix.required_insert_count > insert_count
+                && blocked as u64 >= self.max_blocked_streams
+            {
                 return Poll::Ready(Err(ErrorCode::QpackDecompressionFailed
                     .connection("peer exceeded the advertised QPACK blocked-stream limit")));
             }
@@ -232,14 +229,9 @@ mod state {
                     "dynamic-table instruction received with zero maximum table capacity",
                 ));
             }
-            let previous_count = self.table.insert_count();
             self.table.apply(instruction)?;
-            let increment = self.table.insert_count() - previous_count;
-            if increment != 0 {
-                // Queue progress before any ACK that can reference these insertions.
-                // All producers hold the decoder state lock, preserving this wire order.
-                self.send_feedback(vec![DecoderInstruction::InsertCountIncrement(increment)])?;
-            }
+            // Progress occupies one derived count, regardless of burst length.
+            // It is flushed by the writer or immediately before any ACK/cancellation.
             let wakes = self
                 .waiting
                 .values()
@@ -286,18 +278,58 @@ mod state {
                 .collect()
         }
 
-        fn acknowledge(&self, stream_id: u64, required_insert_count: u64) -> Result<()> {
-            if required_insert_count != 0 {
-                self.send_feedback(vec![DecoderInstruction::SectionAcknowledgment(stream_id)])?;
+        fn acknowledge(&mut self, stream_id: u64, required_insert_count: u64) -> Result<bool> {
+            if required_insert_count == 0 {
+                return Ok(true);
             }
+            let progress = usize::from(self.table.insert_count() != self.reported_insert_count);
+            if self.feedback.len() + progress + 1 > super::MAX_PENDING_ACKS {
+                return Ok(false);
+            }
+            self.send_feedback(vec![DecoderInstruction::SectionAcknowledgment(stream_id)])?;
+            Ok(true)
+        }
+
+        fn send_feedback(&mut self, instructions: super::Batch) -> Result<()> {
+            let count = self.table.insert_count();
+            let progress = usize::from(count != self.reported_insert_count);
+            // Keep one slot for progress drained by take_feedback. ACK production
+            // stops earlier, leaving bounded space for synchronous cancellation.
+            if instructions.len()
+                > (super::MAX_PENDING_FEEDBACK - 1).saturating_sub(self.feedback.len() + progress)
+            {
+                return Err(ErrorCode::ExcessiveLoad
+                    .connection("unsent QPACK cancellation feedback exceeds the memory limit"));
+            }
+            if progress != 0 {
+                self.feedback
+                    .push_back(DecoderInstruction::InsertCountIncrement(
+                        count - self.reported_insert_count,
+                    ));
+                self.reported_insert_count = count;
+            }
+            self.feedback.extend(instructions);
             Ok(())
         }
 
-        /// Feedback is required for QPACK correctness, so overload fails the
-        /// connection instead of dropping an instruction or blocking under the
-        /// decoder state lock.
-        fn send_feedback(&self, instructions: super::Batch) -> Result<()> {
-            (self.on_instruction)(instructions)
+        pub(super) fn take_feedback(&mut self) -> (super::Batch, Vec<Waker>) {
+            let mut instructions: super::Batch = self.feedback.drain(..).collect();
+            let count = self.table.insert_count();
+            if count != self.reported_insert_count {
+                instructions.push(DecoderInstruction::InsertCountIncrement(
+                    count - self.reported_insert_count,
+                ));
+                self.reported_insert_count = count;
+            }
+            let wakes = if instructions.is_empty() {
+                Vec::new()
+            } else {
+                self.waiting
+                    .values()
+                    .map(|(_, _, waker)| waker.clone())
+                    .collect()
+            };
+            (instructions, wakes)
         }
 
         /// Shared by immediate and resumed decoding: reject evicted/out-of-range references,

@@ -88,6 +88,8 @@ impl<W> Control<W> {
             .await
             .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())
             .map_err(&mut on_io_failure)?;
+        // Wait for transport acknowledgement before shutdown can close the
+        // connection, even if the peer GOAWAY and request drain are already done.
         writer
             .flush()
             .await
@@ -108,10 +110,9 @@ impl<W> Control<W> {
         bytes.put_control(&ControlFrame::Settings(Frame::new(
             self.local_settings.0.clone(),
         )?));
+        // Transport writes drive transmission without a flush. SETTINGS only
+        // needs to precede subsequent control frames, not wait for an ACK.
         send.write_all(&bytes)
-            .await
-            .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())?;
-        send.flush()
             .await
             .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())
     }
