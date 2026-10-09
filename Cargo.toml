@@ -25,8 +25,8 @@ http-body-util = "0.1"
 async-stream = "0.3"
 httlib-huffman = "0.3"
 thiserror = "2"
-qbase = "0.6.4"
-qrecovery = "0.6.2"
+qbase = { git = "https://github.com/genmeta/dquic.git", rev = "34a713b48535892ad9843cf2bb0db285e0d09439" }
+qrecovery = { git = "https://github.com/genmeta/dquic.git", rev = "34a713b48535892ad9843cf2bb0db285e0d09439" }
 tokio = { version = "1", features = ["macros", "rt", "io-util", "sync", "time"] }
 
 [dev-dependencies]
