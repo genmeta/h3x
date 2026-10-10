@@ -466,6 +466,7 @@ async fn constructor_starts_critical_stream_tasks_and_io_supports_writes() {
     let connection = H3Connection::new(
         TestTransport::new(None, Err(ErrorCode::InternalError.connection("unused"))),
         Settings::default(),
+        |_| {},
     )
     .unwrap();
     tokio::task::yield_now().await;
@@ -479,7 +480,7 @@ async fn constructor_starts_critical_stream_tasks_and_io_supports_writes() {
 
 #[tokio::test]
 async fn pool_registers_and_drains_established_connections() {
-    let pool = crate::Pool::new(|_: u8| async {
+    let pool = crate::Pool::new(|_: u8, _callback| async {
         Err::<H3Connection<TestTransport>, crate::Error>(
             ErrorCode::InternalError.connection("factory should not run"),
         )
@@ -505,7 +506,7 @@ async fn pool_registers_and_drains_established_connections() {
 
 #[tokio::test]
 async fn pool_keeps_one_connection_from_each_direction() {
-    let pool = crate::Pool::new(|_: u8| async {
+    let pool = crate::Pool::new(|_: u8, _callback| async {
         Ok::<_, crate::Error>(connection(TestTransport::new(
             None,
             Err(ErrorCode::InternalError.connection("unused")),

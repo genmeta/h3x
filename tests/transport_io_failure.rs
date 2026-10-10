@@ -171,6 +171,7 @@ async fn accept_error_wakes_goaway_and_idle_critical_writers() {
             writers: writers.clone(),
         },
         Settings::default(),
+        |_| {},
     )
     .unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -208,7 +209,7 @@ async fn pool_returns_factory_error_and_retries_on_next_get() {
     let builds = Arc::new(AtomicUsize::new(0));
     let pool = h3x::Pool::new({
         let builds = builds.clone();
-        move |_: u8| {
+        move |_: u8, callback| {
             let builds = builds.clone();
             async move {
                 if builds.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -220,6 +221,7 @@ async fn pool_returns_factory_error_and_retries_on_next_get() {
                         writers: Arc::new(std::sync::Mutex::new(Vec::new())),
                     },
                     Settings::default(),
+                    callback,
                 )
                 .map_err(|_| "H3 initialization failed")
             }
@@ -243,7 +245,7 @@ async fn pool_removal_allows_inflight_build_without_replacing_new_entry() {
         let builds = builds.clone();
         let started = started.clone();
         let resume = resume.clone();
-        move |_: u8| {
+        move |_: u8, callback| {
             let builds = builds.clone();
             let started = started.clone();
             let resume = resume.clone();
@@ -258,6 +260,7 @@ async fn pool_removal_allows_inflight_build_without_replacing_new_entry() {
                         writers: Arc::new(std::sync::Mutex::new(Vec::new())),
                     },
                     Settings::default(),
+                    callback,
                 )
             }
         }
@@ -292,7 +295,7 @@ async fn pool_serializes_builds_and_replaces_goaway_connections() {
     let builds = Arc::new(AtomicUsize::new(0));
     let pool = h3x::Pool::new({
         let builds = builds.clone();
-        move |_: u8| {
+        move |_: u8, callback| {
             let builds = builds.clone();
             async move {
                 builds.fetch_add(1, Ordering::SeqCst);
@@ -303,6 +306,7 @@ async fn pool_serializes_builds_and_replaces_goaway_connections() {
                         writers: Arc::new(std::sync::Mutex::new(Vec::new())),
                     },
                     Settings::default(),
+                    callback,
                 )
             }
         }
@@ -322,4 +326,201 @@ async fn pool_serializes_builds_and_replaces_goaway_connections() {
     assert_eq!(builds.load(Ordering::SeqCst), 2);
     assert!(pool.remove(&1));
     assert!(!pool.remove(&1));
+}
+
+#[tokio::test]
+async fn old_transport_failure_preserves_replacement_and_removal_is_idempotent() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let builds = Arc::new(AtomicUsize::new(0));
+    let (first_failure, _) = watch::channel(None);
+    let (exited, mut exit_count) = watch::channel(0usize);
+    let pool = h3x::Pool::new({
+        let builds = builds.clone();
+        let first_failure = first_failure.clone();
+        move |_: u8, callback| {
+            let build = builds.fetch_add(1, Ordering::SeqCst);
+            let failure = if build == 0 {
+                first_failure.clone()
+            } else {
+                watch::channel(None).0
+            };
+            let exited = exited.clone();
+            async move {
+                H3Connection::new(
+                    IoFailureTransport {
+                        failure,
+                        writers: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    },
+                    Settings::default(),
+                    move |connection| {
+                        callback(connection);
+                        exited.send_modify(|count| *count += 1);
+                    },
+                )
+            }
+        }
+    });
+
+    let first = pool.get(&1).await.unwrap();
+    assert!(pool.remove(&1));
+    let replacement = pool.get(&1).await.unwrap();
+    first_failure.send_replace(Some(
+        ErrorCode::InternalError.connection("connection idle timeout"),
+    ));
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        exit_count.wait_for(|count| *count == 1),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    pool.get(&1).await.unwrap();
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+    // Reusing the callback after replacement must still target only its original slot.
+    drop(first);
+    let callback = pool.on_unreusable(1);
+    callback(&replacement);
+    callback(&replacement);
+    assert!(!pool.remove(&1));
+    pool.get(&1).await.unwrap();
+    assert_eq!(builds.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn idle_transport_failure_evicts_cached_outbound_without_business_io() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let builds = Arc::new(AtomicUsize::new(0));
+    let (failure, _) = watch::channel(None);
+    let (exited, mut exit_count) = watch::channel(0usize);
+    let pool = h3x::Pool::new({
+        let builds = builds.clone();
+        let failure = failure.clone();
+        move |_: u8, callback| {
+            let first = builds.fetch_add(1, Ordering::SeqCst) == 0;
+            let failure = if first {
+                failure.clone()
+            } else {
+                watch::channel(None).0
+            };
+            let exited = exited.clone();
+            async move {
+                H3Connection::new(
+                    IoFailureTransport {
+                        failure,
+                        writers: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    },
+                    Settings::default(),
+                    move |connection| {
+                        callback(connection);
+                        exited.send_modify(|count| *count += 1);
+                    },
+                )
+            }
+        }
+    });
+
+    let _failed = pool.get(&1).await.unwrap();
+    failure.send_replace(Some(
+        ErrorCode::InternalError.connection("connection idle timeout"),
+    ));
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        exit_count.wait_for(|count| *count == 1),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!pool.remove(&1));
+    let _replacement = pool.get(&1).await.unwrap();
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn outbound_exit_before_factory_returns_does_not_cache_failed_connection() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let builds = Arc::new(AtomicUsize::new(0));
+    let pool = h3x::Pool::new({
+        let builds = builds.clone();
+        move |_: u8, callback| {
+            let first = builds.fetch_add(1, Ordering::SeqCst) == 0;
+            async move {
+                let error = first.then(|| ErrorCode::InternalError.connection("no viable path"));
+                let (exited, mut exit_count) = watch::channel(0usize);
+                let connection = H3Connection::new(
+                    IoFailureTransport {
+                        failure: watch::channel(error).0,
+                        writers: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    },
+                    Settings::default(),
+                    move |connection| {
+                        callback(connection);
+                        exited.send_modify(|count| *count += 1);
+                    },
+                )?;
+                if first {
+                    tokio::time::timeout(
+                        Duration::from_secs(1),
+                        exit_count.wait_for(|count| *count == 1),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                }
+                Ok::<_, Error>(connection)
+            }
+        }
+    });
+
+    let failed = pool.get(&1).await.unwrap();
+    assert!(!pool.remove(&1));
+    let _replacement = pool.get(&1).await.unwrap();
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    drop(failed);
+}
+
+#[tokio::test]
+async fn inbound_termination_preserves_outbound_and_rejects_late_insertion() {
+    let pool = h3x::Pool::new(|_: u8, callback| async move {
+        H3Connection::new(
+            IoFailureTransport {
+                failure: watch::channel(None).0,
+                writers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            },
+            Settings::default(),
+            callback,
+        )
+    });
+    let outbound = pool.get(&1).await.unwrap();
+    let (failure, _) = watch::channel(None);
+    let (exited, mut exit_count) = watch::channel(0usize);
+    let callback = pool.on_unreusable(1);
+    let inbound = H3Connection::new(
+        IoFailureTransport {
+            failure: failure.clone(),
+            writers: Arc::new(std::sync::Mutex::new(Vec::new())),
+        },
+        Settings::default(),
+        move |connection| {
+            callback(connection);
+            exited.send_modify(|count| *count += 1);
+        },
+    )
+    .unwrap();
+    assert!(pool.insert(1, inbound.clone()).is_ok());
+    failure.send_replace(Some(ErrorCode::InternalError.connection("no viable path")));
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        exit_count.wait_for(|count| *count == 1),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let cached = pool.drain();
+    assert_eq!(cached.len(), 1);
+    assert!(std::ptr::eq(cached[0].transport(), outbound.transport()));
+    assert!(pool.insert(1, inbound).is_err());
 }

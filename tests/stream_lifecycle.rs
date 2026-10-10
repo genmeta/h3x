@@ -7,6 +7,46 @@ use qrecovery::{recv::StopSending, send::CancelStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
+async fn peer_goaway_evicts_connection_and_preserves_incoming_streams() {
+    let pool = h3x::Pool::new(|_: u8, _callback| async {
+        Err::<h3x::H3Connection<support::Connection>, h3x::Error>(
+            ErrorCode::InternalError.connection("factory should not run"),
+        )
+    });
+    let callback = pool.on_unreusable(1);
+    let (removed, mut removal) = tokio::sync::watch::channel(false);
+    let (client, server) = support::connection_pair_with_callbacks(
+        |_| {},
+        move |connection| {
+            callback(connection);
+            removed.send_replace(true);
+        },
+    );
+    assert!(pool.insert(1, server.clone()).is_ok());
+    let (mut writer, _reader) = client.open_bi().await.unwrap();
+    let client_drain = tokio::spawn(client.goaway());
+    tokio::time::timeout(Duration::from_secs(1), removal.wait_for(|removed| *removed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!pool.remove(&1));
+    assert_eq!(
+        server.open_bi().await.err().unwrap().code,
+        ErrorCode::RequestRejected
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        writer.write_all(b"still usable").await.unwrap();
+        let (_writer, mut reader) = server.accept_bi().await.unwrap();
+        let mut bytes = [0; 12];
+        reader.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"still usable");
+    })
+    .await
+    .unwrap();
+    client_drain.abort();
+}
+
+#[tokio::test]
 async fn drain_waits_for_read_after_write_shutdown() {
     let (client, server) = support::connection_pair();
     let (mut cw, mut cr) = client.open_bi().await.unwrap();

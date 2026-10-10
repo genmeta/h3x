@@ -4,10 +4,10 @@ use std::{future::Future, hash::Hash, pin::Pin, sync::Arc};
 use dashmap::{DashMap, mapref::entry::Entry};
 use tokio::sync::OnceCell;
 
-use crate::{H3Connection, Transport};
+use crate::{H3Connection, Transport, UnreusableCallback};
 
 type ConnectFuture<T, E> = Pin<Box<dyn Future<Output = Result<H3Connection<T>, E>> + Send>>;
-type Factory<K, T, E> = dyn Fn(K) -> ConnectFuture<T, E> + Send + Sync;
+type Factory<K, T, E> = dyn Fn(K, UnreusableCallback<T>) -> ConnectFuture<T, E> + Send + Sync;
 // The first slot serializes outbound construction; the second holds one accepted connection.
 type ConnectionSlots<T> = (Arc<OnceCell<H3Connection<T>>>, Option<H3Connection<T>>);
 
@@ -36,12 +36,12 @@ where
 {
     pub fn new<F, Fut>(factory: F) -> Self
     where
-        F: Fn(K) -> Fut + Send + Sync + 'static,
+        F: Fn(K, UnreusableCallback<T>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<H3Connection<T>, E>> + Send + 'static,
     {
         Self {
             inner: Arc::new(PoolInner {
-                factory: Box::new(move |key| Box::pin(factory(key))),
+                factory: Box::new(move |key, callback| Box::pin(factory(key, callback))),
                 connections: DashMap::new(),
             }),
         }
@@ -52,24 +52,29 @@ where
     /// Construction is serialized per key.
     pub async fn get(&self, key: &K) -> Result<H3Connection<T>, E> {
         let outbound = {
-            let entry = self
+            let mut entry = self
                 .inner
                 .connections
                 .entry(key.clone())
                 .or_insert_with(|| (Arc::new(OnceCell::new()), None));
             if let Some(connection) = entry.0.get() {
-                return Ok(connection.clone());
+                if connection.is_reusable() {
+                    return Ok(connection.clone());
+                }
+                entry.0 = Arc::new(OnceCell::new());
             }
             if let Some(connection) = &entry.1 {
-                return Ok(connection.clone());
+                if connection.is_reusable() {
+                    return Ok(connection.clone());
+                }
+                entry.1 = None;
             }
             entry.0.clone()
         };
         match outbound
             .get_or_try_init(|| async {
-                let connection = (self.inner.factory)(key.clone()).await?;
-                self.observe_outbound(key.clone(), outbound.clone(), connection.clone());
-                Ok::<_, E>(connection)
+                (self.inner.factory)(key.clone(), self.outbound_callback(key.clone(), &outbound))
+                    .await
             })
             .await
         {
@@ -79,7 +84,7 @@ where
                     .inner
                     .connections
                     .get(key)
-                    .and_then(|entry| entry.1.clone())
+                    .and_then(|entry| entry.1.clone().filter(H3Connection::is_reusable))
                 {
                     Ok(connection)
                 } else {
@@ -89,7 +94,20 @@ where
         }
     }
 
-    /// Register one accepted connection for a key. A later accepted connection
+    /// Create a callback to pass to `H3Connection::new` before inserting an inbound connection.
+    /// Only the matching connection is removed; replacements and the other direction survive.
+    pub fn on_unreusable(&self, key: K) -> UnreusableCallback<T> {
+        let weak = Arc::downgrade(&self.inner);
+        Box::new(move |connection| {
+            if let Some(inner) = weak.upgrade() {
+                Self { inner }.remove_connection(&key, connection);
+            }
+        })
+    }
+
+    /// Register one accepted connection constructed with `self.on_unreusable(key.clone())`.
+    /// An already unusable connection is returned without entering the pool.
+    /// A later accepted connection
     /// is returned to its caller to serve and close outside the reuse pool.
     pub fn insert(&self, key: K, connection: H3Connection<T>) -> Result<(), H3Connection<T>> {
         {
@@ -98,6 +116,16 @@ where
                 .connections
                 .entry(key.clone())
                 .or_insert_with(|| (Arc::new(OnceCell::new()), None));
+            if !connection.is_reusable() {
+                return Err(connection);
+            }
+            if entry
+                .1
+                .as_ref()
+                .is_some_and(|current| !current.is_reusable())
+            {
+                entry.1 = None;
+            }
             if entry.1.is_some()
                 || entry
                     .0
@@ -108,7 +136,6 @@ where
             }
             entry.1 = Some(connection.clone());
         }
-        self.observe_inbound(key, connection);
         Ok(())
     }
 
@@ -165,17 +192,17 @@ where
         removed
     }
 
-    fn observe_outbound(
+    fn outbound_callback(
         &self,
         key: K,
-        slot: Arc<OnceCell<H3Connection<T>>>,
-        connection: H3Connection<T>,
-    ) {
+        slot: &Arc<OnceCell<H3Connection<T>>>,
+    ) -> UnreusableCallback<T> {
         let weak = Arc::downgrade(&self.inner);
-        tokio::spawn(async move {
-            connection.local_goaway().await;
+        let slot = Arc::downgrade(slot);
+        Box::new(move |_| {
             if let Some(inner) = weak.upgrade()
-                && let Entry::Occupied(mut entry) = inner.connections.entry(key)
+                && let Some(slot) = slot.upgrade()
+                && let Entry::Occupied(mut entry) = inner.connections.entry(key.clone())
                 && Arc::ptr_eq(&entry.get().0, &slot)
             {
                 if entry.get().1.is_some() {
@@ -184,27 +211,6 @@ where
                     entry.remove();
                 }
             }
-        });
-    }
-
-    fn observe_inbound(&self, key: K, connection: H3Connection<T>) {
-        let weak = Arc::downgrade(&self.inner);
-        tokio::spawn(async move {
-            connection.local_goaway().await;
-            if let Some(inner) = weak.upgrade()
-                && let Entry::Occupied(mut entry) = inner.connections.entry(key)
-                && entry
-                    .get()
-                    .1
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(&current.transport, &connection.transport))
-            {
-                let slots = entry.get_mut();
-                slots.1 = None;
-                if slots.0.get().is_none() && Arc::strong_count(&slots.0) == 1 {
-                    entry.remove();
-                }
-            }
-        });
+        })
     }
 }
