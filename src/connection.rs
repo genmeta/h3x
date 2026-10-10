@@ -36,7 +36,7 @@ pub struct H3Connection<T: Transport> {
     pub(crate) transport: Arc<T>,
     qpack: ArcQpack,
     control: Arc<control::Control<T::StreamWriter>>,
-    bi_streams: ArcBiStreams<T::StreamReader, T::StreamWriter>,
+    pub(crate) bi_streams: ArcBiStreams<T::StreamReader, T::StreamWriter>,
 }
 
 /// Called when a connection stops accepting new requests or its background driver exits.
@@ -118,13 +118,6 @@ impl<T: Transport> H3Connection<T> {
             }
         });
         Ok(connection)
-    }
-
-    pub(crate) fn is_reusable(&self) -> bool {
-        let streams = self.bi_streams.lock().unwrap();
-        streams.local_not_goway().is_ok()
-            && streams.remote_no_goway().is_ok()
-            && self.qpack.error().is_none()
     }
 
     /// Compression state shared by messages on this connection.
