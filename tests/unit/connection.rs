@@ -485,6 +485,10 @@ async fn pool_registers_and_drains_established_connections() {
             ErrorCode::InternalError.connection("factory should not run"),
         )
     });
+    let second = connection(TestTransport::new(
+        None,
+        Err(ErrorCode::InternalError.connection("unused")),
+    ));
     let rejected = connection(TestTransport::new(
         None,
         Err(ErrorCode::InternalError.connection("unused")),
@@ -496,16 +500,19 @@ async fn pool_registers_and_drains_established_connections() {
 
     assert!(pool.insert(1, connection.clone()).is_ok());
     assert!(pool.insert(1, connection.clone()).is_err());
+    assert!(pool.insert(1, second.clone()).is_ok());
     assert!(pool.insert(1, rejected.clone()).is_err());
     assert!(!pool.remove_connection(&1, &rejected));
     let registered = pool.get(&1).await.unwrap();
     assert!(Arc::ptr_eq(&registered.transport, &connection.transport));
-    assert_eq!(pool.drain().len(), 1);
+    let drained = pool.drain();
+    assert_eq!(drained.len(), 2);
+    assert!(Arc::ptr_eq(&drained[1].transport, &second.transport));
     assert!(!pool.remove(&1));
 }
 
 #[tokio::test]
-async fn pool_keeps_one_connection_from_each_direction() {
+async fn pool_keeps_two_connections_regardless_of_origin() {
     let pool = crate::Pool::new(|_: u8, _callback| async {
         Ok::<_, crate::Error>(connection(TestTransport::new(
             None,
