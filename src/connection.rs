@@ -39,6 +39,10 @@ pub struct H3Connection<T: Transport> {
     bi_streams: ArcBiStreams<T::StreamReader, T::StreamWriter>,
 }
 
+/// Called when a connection stops accepting new requests or its background driver exits.
+/// The callback may run more than once and must not block or panic.
+pub type UnreusableCallback<T> = Box<dyn Fn(&H3Connection<T>) + Send + 'static>;
+
 impl<T: Transport> H3Connection<T> {
     /// Borrow the underlying transport.
     pub fn transport(&self) -> &T {
@@ -51,9 +55,15 @@ impl<T: Transport> H3Connection<T> {
         self.transport.close(reason.into(), code)
     }
 
-    /// Start the control, SETTINGS, and connection tasks.
+    /// Install the reuse-removal callback before starting the connection tasks.
+    /// The driver invokes it on local/peer GOAWAY and after connection termination.
+    /// Pass `|_| {}` for a connection without a reuse pool.
     /// On failure or cancellation, transport cleanup follows its own drop semantics.
-    pub fn new(transport: T, settings: Settings) -> Result<Self> {
+    pub fn new(
+        transport: T,
+        settings: Settings,
+        on_unreusable: impl Fn(&Self) + Send + 'static,
+    ) -> Result<Self> {
         let transport = Arc::new(transport);
         let settings = Arc::new(settings);
         let bi = ArcBiStreams::new(transport.role());
@@ -90,8 +100,31 @@ impl<T: Transport> H3Connection<T> {
             control,
             bi_streams: bi,
         };
-        tokio::spawn(connection.clone().accept_and_process_uni());
+        tokio::spawn({
+            let connection = connection.clone();
+            async move {
+                let mut processing = pin!(connection.clone().accept_and_process_uni());
+                tokio::select! {
+                    _ = &mut processing => {
+                        on_unreusable(&connection);
+                        return;
+                    },
+                    _ = connection.local_goaway() => {},
+                    _ = connection.peer_goaway() => {},
+                }
+                on_unreusable(&connection);
+                processing.await;
+                on_unreusable(&connection);
+            }
+        });
         Ok(connection)
+    }
+
+    pub(crate) fn is_reusable(&self) -> bool {
+        let streams = self.bi_streams.lock().unwrap();
+        streams.local_not_goway().is_ok()
+            && streams.remote_no_goway().is_ok()
+            && self.qpack.error().is_none()
     }
 
     /// Compression state shared by messages on this connection.
@@ -165,6 +198,13 @@ impl<T: Transport> H3Connection<T> {
         let notification = self.bi_streams.lock().unwrap().local_goaway();
         async move {
             notification.await;
+        }
+    }
+
+    fn peer_goaway(&self) -> impl Future<Output = ()> + Send + use<T> {
+        let notification = self.bi_streams.lock().unwrap().recv_goway();
+        async move {
+            let _ = notification.await;
         }
     }
 }
