@@ -189,6 +189,13 @@ impl Transport for Connection {
 
 /// Build the client and server halves of one in-memory HTTP/3 connection.
 pub fn connection_pair() -> (H3Connection<Connection>, H3Connection<Connection>) {
+    connection_pair_with_callbacks(|_| {}, |_| {})
+}
+
+pub fn connection_pair_with_callbacks(
+    client_callback: impl Fn(&H3Connection<Connection>) + Send + 'static,
+    server_callback: impl Fn(&H3Connection<Connection>) + Send + 'static,
+) -> (H3Connection<Connection>, H3Connection<Connection>) {
     let (client_bi, server_bi) = mpsc::unbounded_channel();
     let (server_bi_reply, client_bi_reply) = mpsc::unbounded_channel();
     let (client_uni, server_uni) = mpsc::unbounded_channel();
@@ -214,8 +221,8 @@ pub fn connection_pair() -> (H3Connection<Connection>, H3Connection<Connection>)
     };
 
     (
-        H3Connection::new(client, Settings::default()).unwrap(),
-        H3Connection::new(server, Settings::default()).unwrap(),
+        H3Connection::new(client, Settings::default(), client_callback).unwrap(),
+        H3Connection::new(server, Settings::default(), server_callback).unwrap(),
     )
 }
 

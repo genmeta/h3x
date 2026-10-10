@@ -88,11 +88,25 @@ or cancels the body.
 same authenticated connection; keep credentials and connection configuration in
 the factory, and use a different key or `remove(&key)` when identity policy changes.
 
-`Pool::new(factory)` accepts an asynchronous `Fn(K)` returning
+`H3Connection::new(transport, settings, on_unreusable)` installs a callback before
+starting its background driver. The driver calls it on local or peer GOAWAY and
+after termination, including transport idle timeout and no-viable-path errors.
+The callback receives the connection, may run more than once, and must not block
+or panic. Pass `|_| {}` when no callback is needed.
+
+`Pool::new(factory)` accepts an asynchronous `Fn(K, UnreusableCallback<T>)` returning
 `Result<H3Connection<T>, E>`. The factory must complete the QUIC handshake,
 authentication and ALPN `h3` verification before returning an initialized H3
 connection, and reclaim unreturned resources when cancelled. Do not return a
-connection already managed by another pool.
+connection already managed by another pool. Pass the supplied callback to
+`H3Connection::new` during construction; the pool uses weak references and slot
+identity to remove only the matching outbound connection, even if the driver
+exits before construction returns.
+
+For an inbound connection, pass `pool.on_unreusable(key.clone())` to
+`H3Connection::new`, then call `pool.insert(key, connection)`. Insertion rejects
+connections that have already failed or received/sent GOAWAY. Later duplicate
+inbound connections are returned to their caller to serve outside the pool.
 
 - `get(&key).await` reuses a connection or serializes construction for that key
   using an asynchronous entry lock. Different keys connect independently.
@@ -100,10 +114,11 @@ connection already managed by another pool.
 - `remove(&key)` removes the entry from reuse without sending GOAWAY or closing
   the transport. Calls already holding the removed entry may still finish and
   return its connection; they do not reinsert it or modify a replacement entry.
-- Local GOAWAY automatically removes the entry. The pool does not call `accept_bi`;
-  the component routing peer-initiated streams must own that receive loop and remove
-  the connection after a terminal accept error.
-  Removal is asynchronous; `get` may return the connection before its observer runs.
+- Local/peer GOAWAY and connection termination automatically remove the matching
+  slot through the constructor callback. The pool does not call `accept_bi`;
+  the component routing peer-initiated streams owns that receive loop.
+  Removal runs on the background driver. `get` also checks known failure and
+  GOAWAY state, but a connection can still fail after it has been returned.
   Existing handles and admitted requests remain owned by the application.
 - The pool has no shutdown or draining state. Dropping it releases cached handles
   without forcibly closing transports; applications manage connection shutdown.

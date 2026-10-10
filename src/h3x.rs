@@ -13,7 +13,7 @@ pub use common::{
     request::{ReadRequest, WriteRequest},
     response::{ReadResponse, WriteResponse},
 };
-pub use connection::{H3Connection, Settings};
+pub use connection::{H3Connection, Settings, UnreusableCallback};
 pub use error::{Error, ErrorCode, ErrorDetail, Result};
 pub use frame::Goaway;
 pub use pool::Pool;
