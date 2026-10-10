@@ -162,7 +162,7 @@ impl Transport for IoFailureTransport {
 }
 
 #[tokio::test]
-async fn accept_error_wakes_goaway_and_idle_critical_writers() {
+async fn accept_error_fails_later_goaway_and_releases_idle_critical_writers() {
     let (failure, _) = watch::channel(None);
     let writers = Arc::new(std::sync::Mutex::new(Vec::new()));
     let connection = H3Connection::new(
@@ -184,12 +184,6 @@ async fn accept_error_wakes_goaway_and_idle_critical_writers() {
     let goaway = connection.clone().goaway();
     let expected = ErrorCode::InternalError.connection("accept observed connection failure");
     failure.send_replace(Some(expected.clone()));
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), goaway)
-            .await
-            .unwrap(),
-        Err(expected)
-    );
     let receivers = std::mem::take(&mut *writers.lock().unwrap());
     for mut receiver in receivers {
         tokio::time::timeout(
@@ -200,6 +194,12 @@ async fn accept_error_wakes_goaway_and_idle_critical_writers() {
         .unwrap()
         .unwrap();
     }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), goaway)
+            .await
+            .unwrap(),
+        Err(expected)
+    );
 }
 
 #[tokio::test]

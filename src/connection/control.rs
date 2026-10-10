@@ -19,6 +19,7 @@ use crate::{
 pub(super) struct Control<W = tokio::io::Sink> {
     local_settings: Arc<super::Settings>,
     peer_settings: OnceLock<super::Settings>,
+    settings_received: tokio::sync::Notify,
     stream: ArcReceiving<Arc<Mutex<W>>>,
 }
 
@@ -54,6 +55,7 @@ impl<W> Control<W> {
         Self {
             local_settings,
             peer_settings: OnceLock::new(),
+            settings_received: tokio::sync::Notify::new(),
             stream: ArcReceiving::default(),
         }
     }
@@ -96,6 +98,17 @@ impl<W> Control<W> {
             .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())
             .map_err(on_io_failure)?;
         Ok(Arc::clone(&stream))
+    }
+
+    pub(super) async fn peer_settings(&self) -> super::Settings {
+        loop {
+            // Construct before checking so notify_waiters cannot race with registration.
+            let notified = self.settings_received.notified();
+            if let Some(settings) = self.peer_settings.get() {
+                return settings.clone();
+            }
+            notified.await;
+        }
     }
 
     pub(super) fn close(&self) {
@@ -141,6 +154,8 @@ impl<W> Control<W> {
         self.peer_settings
             .set(super::Settings(settings))
             .map_err(|_| ErrorCode::SettingsError.connection("peer settings already received"))?;
+
+        self.settings_received.notify_waiters();
 
         let mut last_goaway_id = None;
         loop {

@@ -118,6 +118,15 @@ impl<T: Transport> H3Connection<T> {
         Ok(connection)
     }
 
+    /// Wait for validated peer SETTINGS, returning an error if the connection fails.
+    pub async fn peer_settings(&self) -> Result<Settings> {
+        tokio::select! {
+            biased;
+            error = self.qpack.failed() => Err(error),
+            settings = self.control.peer_settings() => Ok(settings),
+        }
+    }
+
     /// Compression state shared by messages on this connection.
     pub fn qpack(&self) -> &ArcQpack {
         &self.qpack
@@ -344,12 +353,20 @@ mod tests;
 
 // Local connection settings.
 
-/// Local settings advertised when constructing an HTTP/3 connection.
-/// Extended CONNECT support is always advertised.
+/// HTTP/3 settings advertised locally or received from a peer.
+/// Local constructors always advertise Extended CONNECT support.
 #[derive(Clone, Debug)]
 pub struct Settings(pub(crate) frame::Settings);
 
 impl Settings {
+    /// Return the advertised value for a SETTINGS identifier, without applying defaults.
+    /// Missing identifiers and IDs outside the QUIC variable-integer range return `None`.
+    /// Unknown extension identifiers can be queried in the same way as known settings.
+    pub fn get(&self, id: u64) -> Option<u64> {
+        let id = VarInt::try_from(id).ok()?;
+        self.0.values.get(&id).map(|value| value.into_u64())
+    }
+
     pub fn new(
         max_field_section_size: u64,
         max_table_capacity: u64,
