@@ -213,7 +213,7 @@ async fn pool_returns_factory_error_and_retries_on_next_get() {
             let builds = builds.clone();
             async move {
                 if builds.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return Err("factory failed");
+                    return Err(ErrorCode::InternalError.connection("factory failed"));
                 }
                 H3Connection::new(
                     IoFailureTransport {
@@ -223,12 +223,12 @@ async fn pool_returns_factory_error_and_retries_on_next_get() {
                     Settings::default(),
                     callback,
                 )
-                .map_err(|_| "H3 initialization failed")
+                .map_err(|_| ErrorCode::InternalError.connection("H3 initialization failed"))
             }
         }
     });
 
-    assert!(matches!(pool.get(&1).await, Err("factory failed")));
+    assert_eq!(pool.get(&1).await.err().unwrap().reason, "factory failed");
     let _connection = pool.get(&1).await.unwrap();
     pool.get(&1).await.unwrap();
     assert_eq!(builds.load(Ordering::SeqCst), 2);
@@ -439,7 +439,7 @@ async fn idle_transport_failure_evicts_cached_outbound_without_business_io() {
 }
 
 #[tokio::test]
-async fn outbound_exit_before_factory_returns_does_not_cache_failed_connection() {
+async fn outbound_exit_before_factory_returns_fails_get_without_caching() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let builds = Arc::new(AtomicUsize::new(0));
@@ -475,11 +475,11 @@ async fn outbound_exit_before_factory_returns_does_not_cache_failed_connection()
         }
     });
 
-    let failed = pool.get(&1).await.unwrap();
+    let error = pool.get(&1).await.err().unwrap();
+    assert_eq!(error.reason, "no viable path");
     assert!(!pool.remove(&1));
     let _replacement = pool.get(&1).await.unwrap();
     assert_eq!(builds.load(Ordering::SeqCst), 2);
-    drop(failed);
 }
 
 #[tokio::test]
@@ -523,4 +523,259 @@ async fn inbound_termination_preserves_outbound_and_rejects_late_insertion() {
     assert_eq!(cached.len(), 1);
     assert!(std::ptr::eq(cached[0].transport(), outbound.transport()));
     assert!(pool.insert(1, inbound).is_err());
+}
+
+fn healthy_connection(
+    callback: h3x::UnreusableCallback<IoFailureTransport>,
+) -> H3Connection<IoFailureTransport> {
+    H3Connection::new(
+        IoFailureTransport {
+            failure: watch::channel(None).0,
+            writers: Arc::new(std::sync::Mutex::new(Vec::new())),
+        },
+        Settings::default(),
+        callback,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn accepted_connections_are_reusable_during_build_and_survive_its_result() {
+    // Exercise successful, failed, and already-draining factory results, with
+    // either room for the built connection or a cache filled by accepted peers.
+    for outcome in 0..3 {
+        for accepted_count in 1..=2 {
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let pool = h3x::Pool::new({
+                let resume = resume.clone();
+                move |_: u8, callback| {
+                    let resume = resume.clone();
+                    async move {
+                        resume.notified().await;
+                        if outcome == 1 {
+                            return Err(ErrorCode::InternalError.connection("factory failed"));
+                        }
+                        let connection = healthy_connection(callback);
+                        if outcome == 2 {
+                            drop(connection.clone().goaway());
+                        }
+                        Ok(connection)
+                    }
+                }
+            });
+            let building = pool.get(&1);
+            tokio::pin!(building);
+            assert!(futures::poll!(&mut building).is_pending());
+            let waiting = pool.get(&1);
+            tokio::pin!(waiting);
+            assert!(futures::poll!(&mut waiting).is_pending());
+            let mut accepted = Vec::new();
+            for _ in 0..accepted_count {
+                let connection = healthy_connection(pool.on_unreusable(1));
+                assert!(pool.insert(1, connection.clone()).is_ok());
+                accepted.push(connection);
+            }
+            let reused = pool.get(&1).await.unwrap();
+            assert!(std::ptr::eq(reused.transport(), accepted[0].transport()));
+            resume.notify_one();
+            let built = building.await.unwrap();
+            let waited = waiting.await.unwrap();
+            assert!(std::ptr::eq(waited.transport(), accepted[0].transport()));
+            if outcome == 0 {
+                assert!(!std::ptr::eq(built.transport(), accepted[0].transport()));
+            } else {
+                assert!(std::ptr::eq(built.transport(), accepted[0].transport()));
+            }
+            let cached = pool.drain();
+            assert_eq!(cached.len(), if outcome == 0 { 2 } else { accepted_count });
+            if outcome == 0 && accepted_count == 1 {
+                assert!(std::ptr::eq(cached[1].transport(), built.transport()));
+            }
+            for (cached, accepted) in cached.iter().zip(&accepted) {
+                assert!(std::ptr::eq(cached.transport(), accepted.transport()));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn accepted_connection_exit_does_not_start_a_second_concurrent_build() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let builds = Arc::new(AtomicUsize::new(0));
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let pool = h3x::Pool::new({
+        let builds = builds.clone();
+        let resume = resume.clone();
+        move |_: u8, callback| {
+            let builds = builds.clone();
+            let resume = resume.clone();
+            async move {
+                builds.fetch_add(1, Ordering::SeqCst);
+                resume.notified().await;
+                Ok::<_, Error>(healthy_connection(callback))
+            }
+        }
+    });
+    let first = pool.get(&1);
+    tokio::pin!(first);
+    assert!(futures::poll!(&mut first).is_pending());
+    let (exited, mut exit) = watch::channel(false);
+    let callback = pool.on_unreusable(1);
+    let accepted = healthy_connection(Box::new(move |connection| {
+        callback(connection);
+        exited.send_replace(true);
+    }));
+    assert!(pool.insert(1, accepted.clone()).is_ok());
+    drop(accepted.goaway());
+    tokio::time::timeout(Duration::from_secs(1), exit.wait_for(|exited| *exited))
+        .await
+        .unwrap()
+        .unwrap();
+    let second = pool.get(&1);
+    tokio::pin!(second);
+    assert!(futures::poll!(&mut second).is_pending());
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    resume.notify_one();
+    let first = first.await.unwrap();
+    let second = second.await.unwrap();
+    assert!(std::ptr::eq(first.transport(), second.transport()));
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancelled_build_releases_waiter_and_different_keys_build_independently() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let builds = Arc::new(AtomicUsize::new(0));
+    let pool = h3x::Pool::new({
+        let builds = builds.clone();
+        move |key: u8, callback| {
+            let builds = builds.clone();
+            async move {
+                let build = builds.fetch_add(1, Ordering::SeqCst);
+                if key == 1 && build == 0 {
+                    pending::<()>().await;
+                }
+                Ok::<_, Error>(healthy_connection(callback))
+            }
+        }
+    });
+    let mut cancelled = Box::pin(pool.get(&1));
+    assert!(futures::poll!(&mut cancelled).is_pending());
+    let mut waiting = Box::pin(pool.get(&1));
+    assert!(futures::poll!(&mut waiting).is_pending());
+    let independent = pool.get(&2).await.unwrap();
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    drop(cancelled);
+    let retried = waiting.await.unwrap();
+    assert!(!std::ptr::eq(retried.transport(), independent.transport()));
+    assert_eq!(builds.load(Ordering::SeqCst), 3);
+    assert_eq!(pool.drain().len(), 2);
+}
+
+#[tokio::test]
+async fn drain_detaches_pending_build_and_its_callback_from_replacement() {
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let pool = h3x::Pool::new({
+        let resume = resume.clone();
+        move |_: u8, callback| {
+            let resume = resume.clone();
+            async move {
+                resume.notified().await;
+                Ok::<_, Error>(healthy_connection(callback))
+            }
+        }
+    });
+    let building = pool.get(&1);
+    tokio::pin!(building);
+    assert!(futures::poll!(&mut building).is_pending());
+    assert!(pool.drain().is_empty());
+    let replacement = healthy_connection(pool.on_unreusable(1));
+    assert!(pool.insert(1, replacement.clone()).is_ok());
+    resume.notify_one();
+    let old = building.await.unwrap();
+    drop(old.goaway());
+    tokio::task::yield_now().await;
+    let cached = pool.drain();
+    assert_eq!(cached.len(), 1);
+    assert!(std::ptr::eq(cached[0].transport(), replacement.transport()));
+}
+
+#[tokio::test]
+async fn factory_completion_failure_and_cancellation_wake_all_waiters() {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+    impl futures::task::ArcWake for WakeCount {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    for outcome in 0..3 {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let pool = h3x::Pool::new({
+            let builds = builds.clone();
+            let resume = resume.clone();
+            move |_: u8, callback| {
+                let builds = builds.clone();
+                let resume = resume.clone();
+                async move {
+                    if builds.fetch_add(1, Ordering::SeqCst) == 0 {
+                        resume.notified().await;
+                        if outcome == 1 {
+                            return Err(ErrorCode::InternalError.connection("factory failed"));
+                        }
+                    }
+                    Ok(healthy_connection(callback))
+                }
+            }
+        });
+        let mut building = Box::pin(pool.get(&1));
+        assert!(futures::poll!(&mut building).is_pending());
+        // Cancelling a waiter must not cancel or release the active builder.
+        let mut abandoned = Box::pin(pool.get(&1));
+        assert!(futures::poll!(&mut abandoned).is_pending());
+        drop(abandoned);
+
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let wakes = Arc::new(WakeCount::default());
+            let waker = futures::task::waker_ref(&wakes);
+            let mut context = Context::from_waker(&waker);
+            let mut waiting = Box::pin(pool.get(&1));
+            assert!(waiting.as_mut().poll(&mut context).is_pending());
+            waiters.push((waiting, wakes));
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        if outcome == 2 {
+            drop(building);
+        } else {
+            resume.notify_one();
+            assert_eq!(building.await.is_ok(), outcome == 0);
+        }
+        // Check actual wakeups before polling again, so a missed notification
+        // cannot be hidden by manually resuming the waiting futures.
+        for (_, wakes) in &waiters {
+            assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        }
+        let mut connections = Vec::new();
+        for (waiting, _) in waiters {
+            connections.push(waiting.await.unwrap());
+        }
+        assert!(
+            connections
+                .iter()
+                .all(|connection| std::ptr::eq(connection.transport(), connections[0].transport()))
+        );
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            if outcome == 0 { 1 } else { 2 }
+        );
+        assert_eq!(pool.drain().len(), 1);
+    }
 }

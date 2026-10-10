@@ -179,3 +179,42 @@ async fn cancelling_response_headers_after_no_error_upload_stop_still_stops_peer
         assert_eq!(h3x::Error::from(error).code, ErrorCode::RequestCancelled);
     }
 }
+
+#[tokio::test]
+async fn pools_can_reuse_different_connections_to_the_same_peer() {
+    let make_pool = || {
+        h3x::Pool::new(|_: u8, _callback| async {
+            Err::<h3x::H3Connection<support::Connection>, h3x::Error>(
+                ErrorCode::InternalError.connection("factory should not run"),
+            )
+        })
+    };
+    let a = make_pool();
+    let b = make_pool();
+    let (a_dialed, b_accepted) =
+        support::connection_pair_with_callbacks(a.on_unreusable(1), b.on_unreusable(1));
+    let (b_dialed, a_accepted) =
+        support::connection_pair_with_callbacks(b.on_unreusable(1), a.on_unreusable(1));
+    assert!(a.insert(1, a_dialed).is_ok());
+    assert!(a.insert(1, a_accepted.clone()).is_ok());
+    assert!(b.insert(1, b_dialed).is_ok());
+    assert!(b.insert(1, b_accepted.clone()).is_ok());
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut a_writer, _a_reader) = a.get(&1).await.unwrap().open_bi().await.unwrap();
+        let (mut b_writer, _b_reader) = b.get(&1).await.unwrap().open_bi().await.unwrap();
+        a_writer.write_all(b"from a").await.unwrap();
+        b_writer.write_all(b"from b").await.unwrap();
+        let (_writer, mut b_reader) = b_accepted.accept_bi().await.unwrap();
+        let (_writer, mut a_reader) = a_accepted.accept_bi().await.unwrap();
+        let mut bytes = [0; 6];
+        b_reader.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"from a");
+        a_reader.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"from b");
+    })
+    .await
+    .unwrap();
+    assert_eq!(a.drain().len(), 2);
+    assert_eq!(b.drain().len(), 2);
+}

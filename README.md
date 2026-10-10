@@ -87,6 +87,11 @@ or cancels the body.
 `Clone + Eq + Hash + Send + Sync + 'static`. Equal keys must permit reuse of the
 same authenticated connection; keep credentials and connection configuration in
 the factory, and use a different key or `remove(&key)` when identity policy changes.
+Each key caches up to two established connections in one collection, regardless
+of whether they were accepted or dialed. Reuse follows insertion order, skipping
+unusable connections. A short synchronous lock protects each entry, which records
+one pending factory call through a completion channel. No lock is held while
+connecting or waiting for that call.
 
 `H3Connection::new(transport, settings, on_unreusable)` installs a callback before
 starting its background driver. The driver calls it on local or peer GOAWAY and
@@ -99,31 +104,50 @@ or panic. Pass `|_| {}` when no callback is needed.
 authentication and ALPN `h3` verification before returning an initialized H3
 connection, and reclaim unreturned resources when cancelled. Do not return a
 connection already managed by another pool. Pass the supplied callback to
-`H3Connection::new` during construction; the pool uses weak references and slot
-identity to remove only the matching outbound connection, even if the driver
-exits before construction returns.
+`H3Connection::new` during construction; the pool uses weak references and
+connection identity to remove only the matching connection. A driver that exits
+before construction returns prevents that connection from entering the cache.
 
 For an inbound connection, pass `pool.on_unreusable(key.clone())` to
-`H3Connection::new`, then call `pool.insert(key, connection)`. Insertion rejects
-connections that have already failed or received/sent GOAWAY. Later duplicate
-inbound connections are returned to their caller to serve outside the pool.
+`H3Connection::new`, then call `pool.insert(key, connection)` after handshake,
+authentication and ALPN verification. Insertion rejects unusable connections,
+duplicate instances and connections beyond the two-connection limit, returning
+them to their caller to manage. Accepted connections may enter while a factory
+is running and are immediately available to new `get` calls. The factory result
+joins the same collection if there is room; otherwise it is returned uncached to
+the original caller. Connections outside the cache still need a receive loop
+and caller-managed shutdown; rejection does not close a transport.
 
-- `get(&key).await` reuses a connection or serializes construction for that key
-  using an asynchronous entry lock. Different keys connect independently.
-  Cancelling or failing construction allows the next waiter to try again.
+- `get(&key).await` reuses a connection, starts construction, or waits for the
+  current factory call's completion channel to close. Different keys connect
+  independently. Completion, failure and cancellation close the channel and wake
+  all waiters to check the entry again.
+  Calls already waiting for construction may continue waiting until it finishes
+  or is cancelled, even if an accepted connection enters the cache meanwhile.
+  Cancelling or failing construction allows the next waiter to try again. The
+  factory error type must implement `From<h3x::Error>`; the default is `h3x::Error`.
+  A connection already unusable when construction returns is reported as an
+  error instead of being cached or returned, unless another cached connection
+  can be reused. `get` rechecks the result before
+  returning it; a connection can still fail after it has been returned.
 - `remove(&key)` removes the entry from reuse without sending GOAWAY or closing
   the transport. Calls already holding the removed entry may still finish and
   return its connection; they do not reinsert it or modify a replacement entry.
+  Old and replacement entries may therefore temporarily have concurrent builds.
 - Local/peer GOAWAY and connection termination automatically remove the matching
-  slot through the constructor callback. The pool does not call `accept_bi`;
+  connection through the constructor callback. The pool does not call `accept_bi`;
   the component routing peer-initiated streams owns that receive loop.
   Removal runs on the background driver. `get` also checks known failure and
   GOAWAY state, but a connection can still fail after it has been returned.
   Existing handles and admitted requests remain owned by the application.
 - The pool has no shutdown or draining state. Dropping it releases cached handles
   without forcibly closing transports; applications manage connection shutdown.
+- `drain()` removes entries and returns all their cached connections. It does not
+  cancel pending construction or prevent concurrent insertion, and is not a
+  shutdown barrier.
 
-The factory controls connection timeouts, and `get` returns factory errors directly.
+The factory controls connection timeouts. `get` returns factory errors when no
+healthy connection is available in its entry.
 The pool does not send or automatically retry requests; after `get`, use `connection.open_bi().await` and the normal request APIs.
 
 ## Request and Response I/O
