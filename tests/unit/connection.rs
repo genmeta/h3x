@@ -354,22 +354,13 @@ async fn unidirectional_stream_types_and_duplicates_fail_the_connection() {
 }
 
 #[tokio::test]
-async fn settings_skip_ack_but_goaway_waits_even_after_peer_goaway_and_drain() {
+async fn goaway_waits_for_flush_without_peer_goaway() {
     let acked = Arc::new(AtomicBool::new(false));
     let mut probe = TestTransport::new(None, Err(ErrorCode::InternalError.connection("unused")));
     probe.uni_flush_acked = Some(acked.clone());
     let connection = connection(probe);
     let local = connection.local_goaway();
     let qpack = connection.qpack.clone();
-    connection
-        .bi_streams
-        .lock()
-        .unwrap()
-        .on_goaway(
-            qbase::sid::StreamId::new(crate::Role::Client, qbase::sid::Dir::Bi, 0),
-            qpack.clone(),
-        )
-        .unwrap();
     let transport = connection.transport.clone();
     let control = connection.control.clone();
     let control_transport = transport.clone();
@@ -386,7 +377,7 @@ async fn settings_skip_ack_but_goaway_waits_even_after_peer_goaway_and_drain() {
     .await;
     let mut shutdown = Box::pin(connection.goaway());
     local.await;
-    // The peer GOAWAY is already received and there are no admitted requests.
+    // There are no admitted requests and the peer has not sent GOAWAY.
     // Local GOAWAY must still be acknowledged before closing the transport.
     poll_fn(|cx| {
         assert!(shutdown.as_mut().poll(cx).is_pending());
@@ -408,7 +399,6 @@ async fn goaway_waits_for_local_settings() {
     let control = connection.control.clone();
     let transport = connection.transport.clone();
     let qpack = connection.qpack.clone();
-    let bi_streams = connection.bi_streams.clone();
     let mut shutdown = Box::pin(connection.goaway());
 
     poll_fn(|cx| {
@@ -422,15 +412,6 @@ async fn goaway_waits_for_local_settings() {
         .open_uni_and_send_setting(transport.clone(), qpack.clone())
         .await
         .unwrap();
-    bi_streams
-        .lock()
-        .unwrap()
-        .on_goaway(
-            qbase::sid::StreamId::new(crate::Role::Client, qbase::sid::Dir::Bi, 0),
-            qpack,
-        )
-        .unwrap();
-
     shutdown.await.unwrap();
     assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
 }
@@ -538,4 +519,137 @@ async fn pool_keeps_two_connections_regardless_of_origin() {
     let reused = pool.get(&1).await.unwrap();
     assert!(Arc::ptr_eq(&reused.transport, &inbound.transport));
     assert_eq!(pool.drain().len(), 1);
+}
+
+#[tokio::test]
+async fn peer_settings_waits_for_validated_settings_and_reports_connection_failure() {
+    let connection = connection(TestTransport::new(
+        None,
+        Err(ErrorCode::InternalError.connection("unused")),
+    ));
+    let waiting = connection.peer_settings();
+    tokio::pin!(waiting);
+    poll_fn(|cx| {
+        assert!(waiting.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+
+    let mut wire = Vec::new();
+    use crate::frame::WriteControl as _;
+    wire.put_control(&frame::Control::Settings(
+        frame::Frame::new(Settings::default().0).unwrap(),
+    ));
+    // EOF after SETTINGS closes the control stream; this direct parser call
+    // lets the test inspect the SETTINGS notification before connection failure.
+    connection
+        .control
+        .receive_control(
+            &mut wire.as_slice(),
+            crate::Role::Client,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        waiting
+            .await
+            .unwrap()
+            .get(crate::SETTINGS_ENABLE_CONNECT_PROTOCOL),
+        Some(1)
+    );
+    assert_eq!(
+        connection
+            .peer_settings()
+            .await
+            .unwrap()
+            .get(crate::SETTINGS_ENABLE_CONNECT_PROTOCOL),
+        Some(1),
+    );
+
+    let error = ErrorCode::ClosedCriticalStream.connection("control stream closed");
+    connection.fail_connection(error.clone());
+    assert_eq!(connection.peer_settings().await.unwrap_err(), error);
+}
+
+#[tokio::test]
+async fn connection_failure_wakes_a_pending_settings_waiter() {
+    let connection = connection(TestTransport::new(
+        None,
+        Err(ErrorCode::InternalError.connection("unused")),
+    ));
+    let waiting = connection.peer_settings();
+    tokio::pin!(waiting);
+    poll_fn(|cx| {
+        assert!(waiting.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let error = ErrorCode::ClosedCriticalStream.connection("closed before SETTINGS");
+    connection.fail_connection(error.clone());
+    assert_eq!(waiting.await.unwrap_err(), error);
+    assert_eq!(
+        Settings(frame::Settings::default()).get(crate::SETTINGS_ENABLE_CONNECT_PROTOCOL),
+        None
+    );
+}
+
+#[tokio::test]
+async fn peer_settings_wakes_all_waiters_and_rejects_invalid_settings() {
+    let active = connection(TestTransport::new(
+        None,
+        Err(ErrorCode::InternalError.connection("unused")),
+    ));
+    let first = active.peer_settings();
+    let second = active.peer_settings();
+    tokio::pin!(first, second);
+    poll_fn(|cx| {
+        assert!(first.as_mut().poll(cx).is_pending());
+        assert!(second.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let mut wire = Vec::new();
+    use crate::frame::WriteControl as _;
+    wire.put_control(&frame::Control::Settings(
+        frame::Frame::new(Settings::default().0).unwrap(),
+    ));
+    active
+        .control
+        .receive_control(&mut wire.as_slice(), Role::Client, |_| Ok(()), |_| Ok(()))
+        .await
+        .unwrap_err();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        assert_eq!(
+            first
+                .await
+                .unwrap()
+                .get(crate::SETTINGS_ENABLE_CONNECT_PROTOCOL),
+            Some(1)
+        );
+        assert_eq!(
+            second
+                .await
+                .unwrap()
+                .get(crate::SETTINGS_ENABLE_CONNECT_PROTOCOL),
+            Some(1)
+        );
+    })
+    .await
+    .expect("all SETTINGS waiters must wake");
+
+    let invalid = connection(TestTransport::new(
+        None,
+        Err(ErrorCode::InternalError.connection("unused")),
+    ));
+    // Control stream, SETTINGS with ENABLE_CONNECT_PROTOCOL=2 (only 0/1 are valid).
+    invalid
+        .clone()
+        .receive_uni(Io::from(&[0, 4, 2, 8, 2]), Arc::new(AtomicU8::new(0)))
+        .await;
+    assert_eq!(
+        invalid.peer_settings().await.unwrap_err().code,
+        ErrorCode::SettingsError
+    );
 }

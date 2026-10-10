@@ -65,11 +65,11 @@ The existing QPACK change signal wakes both feedback writes and connection
 failure waiters. Encoder queue pressure continues to fall back to literal fields.
 
 `goaway(self).await` stops opening and accepting bidirectional streams on every
-clone, writes the local GOAWAY, waits for the peer GOAWAY and admitted requests
-to finish, then closes QUIC with `H3_NO_ERROR` and applies the terminal state to
-H3 waiters.
-Calling `goaway()` freezes admission immediately. Once frozen, GOAWAY sending continues in
-the control task if the caller is cancelled; await shutdown to finish draining.
+clone, writes and flushes the local GOAWAY, waits for admitted requests to
+finish without requiring a peer GOAWAY, then closes QUIC with `H3_NO_ERROR`.
+Calling `goaway()` freezes admission immediately. Dropping the returned future
+leaves admission frozen without completing shutdown; await it to send GOAWAY,
+drain requests, and close the transport.
 Control and QPACK remain available during draining. On a connection managed directly by the
 application, receiving a peer GOAWAY only updates the peer boundary and rejects
 affected requests. A managing `Pool` removes that connection from reuse.
@@ -94,10 +94,10 @@ one pending factory call through a completion channel. No lock is held while
 connecting or waiting for that call.
 
 `H3Connection::new(transport, settings, on_unreusable)` installs a callback before
-starting its background driver. The driver calls it on local or peer GOAWAY and
-after termination, including transport idle timeout and no-viable-path errors.
-The callback receives the connection, may run more than once, and must not block
-or panic. Pass `|_| {}` when no callback is needed.
+starting its background driver. The driver calls it once when local or peer
+GOAWAY occurs, or when the driver terminates, including transport idle timeout
+and no-viable-path errors. It receives the connection and must not block or
+panic. Pass `|_| {}` when no callback is needed.
 
 `Pool::new(factory)` accepts an asynchronous `Fn(K, UnreusableCallback<T>)` returning
 `Result<H3Connection<T>, E>`. The factory must complete the QUIC handshake,
@@ -285,9 +285,19 @@ Extended CONNECT support is enabled and advertised automatically by both
 `Settings::default()` and `Settings::new(...)`; no opt-in is required.
 For CONNECT, drive `write_request` concurrently with response reception and use
 a streaming Body whose data producer can wait for the successful response.
-The caller controls acceptance, rejection and cancellation. Abort the send future
-and drop the response Body when abandoning the exchange. Extended CONNECT assumes
-peer support without waiting for peer SETTINGS.
+Query validated peer SETTINGS with `connection.peer_settings().await?` and
+`Settings::get(id)`. The query returns `Option<u64>` without applying protocol
+defaults, and also supports unknown extension identifiers. The crate exports
+`SETTINGS_QPACK_MAX_TABLE_CAPACITY`, `SETTINGS_MAX_FIELD_SECTION_SIZE`,
+`SETTINGS_QPACK_BLOCKED_STREAMS`, and `SETTINGS_ENABLE_CONNECT_PROTOCOL`.
+Before sending Extended CONNECT, require
+`settings.get(h3x::SETTINGS_ENABLE_CONNECT_PROTOCOL) == Some(1)`. The caller controls acceptance, rejection and
+cancellation. Read response headers with `read_response`, then retain the body
+without polling it until the application accepts the tunnel. h3x may buffer
+received DATA in its bounded window during this wait; a full window backpressures
+the receive task. Only after acceptance should the caller consume the response
+body and produce WebSocket data on the request body. Abort the send future and
+drop the response body when abandoning the exchange.
 
 The server branches on `request.method()` and sends a 2xx response to accept a
 tunnel, passing `Method::CONNECT`. Both directions carry ordinary Body DATA frames.
