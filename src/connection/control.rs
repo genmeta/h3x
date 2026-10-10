@@ -89,7 +89,7 @@ impl<W> Control<W> {
             .map_err(|error| Error::from_io(error, ErrorCode::ClosedCriticalStream).connection())
             .map_err(&mut on_io_failure)?;
         // Wait for transport acknowledgement before shutdown can close the
-        // connection, even if the peer GOAWAY and request drain are already done.
+        // connection, even if the request drain is already done.
         writer
             .flush()
             .await

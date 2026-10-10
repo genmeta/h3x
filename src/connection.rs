@@ -40,7 +40,7 @@ pub struct H3Connection<T: Transport> {
 }
 
 /// Called when a connection stops accepting new requests or its background driver exits.
-/// The callback may run more than once and must not block or panic.
+/// The connection driver calls the callback once; it must not block or panic.
 pub type UnreusableCallback<T> = Box<dyn Fn(&H3Connection<T>) + Send + 'static>;
 
 impl<T: Transport> H3Connection<T> {
@@ -56,7 +56,7 @@ impl<T: Transport> H3Connection<T> {
     }
 
     /// Install the reuse-removal callback before starting the connection tasks.
-    /// The driver invokes it on local/peer GOAWAY and after connection termination.
+    /// The driver invokes it on local/peer GOAWAY or connection termination.
     /// Pass `|_| {}` for a connection without a reuse pool.
     /// On failure or cancellation, transport cleanup follows its own drop semantics.
     pub fn new(
@@ -104,17 +104,15 @@ impl<T: Transport> H3Connection<T> {
             let connection = connection.clone();
             async move {
                 let mut processing = pin!(connection.clone().accept_and_process_uni());
-                tokio::select! {
-                    _ = &mut processing => {
-                        on_unreusable(&connection);
-                        return;
-                    },
-                    _ = connection.local_goaway() => {},
-                    _ = connection.peer_goaway() => {},
+                let terminated = tokio::select! {
+                    _ = &mut processing => true,
+                    _ = connection.local_goaway() => false,
+                    _ = connection.peer_goaway() => false,
+                };
+                on_unreusable(&connection);
+                if !terminated {
+                    processing.await;
                 }
-                on_unreusable(&connection);
-                processing.await;
-                on_unreusable(&connection);
             }
         });
         Ok(connection)
@@ -156,9 +154,9 @@ impl<T: Transport> H3Connection<T> {
         .await
     }
 
-    /// Exchange GOAWAY and wait for admitted requests before closing the transport.
+    /// Send GOAWAY and wait for admitted requests before closing the transport.
     /// Admission freezes immediately; the returned future writes and flushes GOAWAY,
-    /// then waits for the peer and admitted requests before closing the transport.
+    /// then waits for admitted requests without requiring a peer GOAWAY.
     /// Dropping the future leaves admission frozen without completing shutdown.
     pub fn goaway(self) -> impl Future<Output = Result<()>> + Send {
         let qpack = self.qpack.clone();
@@ -169,13 +167,9 @@ impl<T: Transport> H3Connection<T> {
                 error = self.qpack.failed() => return Err(error),
                 result = async {
                     let local_goaway = local_goaway?;
-                    let remote_goaway = self.bi_streams.lock().unwrap().recv_goway();
                     let control_stream = self.control
                         .write_goaway(local_goaway, |error| self.fail_connection(error))
                         .await?;
-                    remote_goaway.await.map_err(|error| {
-                        ErrorCode::InternalError.connection(format!("GOAWAY wait cancelled: {error}"))
-                    })?;
                     let drained = self.bi_streams.drain();
                     drained.await;
                     Ok::<_, crate::Error>(control_stream)
