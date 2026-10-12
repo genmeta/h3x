@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.0] - 2026-10-12
+
+### Changed
+
+- Rework native HTTP/3 streams, QPACK feedback and cancellation.
+- Coordinate connection pooling and expose validated peer SETTINGS.
+- Use qbase and qrecovery 0.7.0 from the dquic 0.8.0 release.
+
+### Release versions
+
+| Package | Previous published version | Prepared version |
+| --- | --- | --- |
+| `h3x` | 0.6.2 | 0.7.0 |
+
+
 ## [0.6.2] - 2026-08-24
 
 ### Changed

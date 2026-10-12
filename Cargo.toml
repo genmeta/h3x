@@ -1,7 +1,7 @@
 [package]
 name = "h3x"
 description = "HTTP/3 message, frame, and stream primitives"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 readme = "README.md"
 repository = "https://github.com/genmeta/h3x"
@@ -25,8 +25,8 @@ http-body-util = "0.1"
 async-stream = "0.3"
 httlib-huffman = "0.3"
 thiserror = "2"
-qbase = { git = "https://github.com/genmeta/dquic.git", rev = "b9af55da49c2e10a6b2004b72a90b0fff81da0ce" }
-qrecovery = { git = "https://github.com/genmeta/dquic.git", rev = "b9af55da49c2e10a6b2004b72a90b0fff81da0ce" }
+qbase = { version = "0.7.0" }
+qrecovery = { version = "0.7.0" }
 tokio = { version = "1", features = ["macros", "rt", "io-util", "sync", "time"] }
 
 [dev-dependencies]
