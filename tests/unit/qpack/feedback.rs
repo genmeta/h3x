@@ -409,7 +409,7 @@ async fn concurrent_ack_pressure_waits_and_recovers_without_failing_connection()
                     assert!(acks.insert(id), "duplicate ACK {id}");
                 }
                 DecoderInstruction::StreamCancellation(id) => {
-                    assert!(id >= 2_000_000 && id < 2_004_096 && id % 4 == 0);
+                    assert!((2_000_000..2_004_096).contains(&id) && id % 4 == 0);
                     assert!(cancellations.insert(id), "duplicate cancellation {id}");
                 }
             }
