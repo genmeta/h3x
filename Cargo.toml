@@ -34,6 +34,6 @@ scopeguard = "1"
 axum = { version = "0.8", default-features = false }
 tokio-util = { version = "0.7", features = ["io"] }
 tower = { version = "0.5", features = ["util"] }
-wasmtime = "47"
+wasmtime = "50"
 wasmtime-wasi = { version = "47", features = ["p2"] }
 wasmtime-wasi-http = { version = "47", features = ["p2"] }
